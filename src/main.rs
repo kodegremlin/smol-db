@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
 mod error;
+mod storage;
 
 fn main() {
-    println!("Hello, world!");
+    let boolean = false as u8;
+    println!("bool = {}", boolean);
 }
