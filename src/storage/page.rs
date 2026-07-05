@@ -1,7 +1,9 @@
+use std::fs::File;
+
 use crate::error::DbError;
 
 /// Size of an element in the index/offset array (u16).
-pub const OFFSET_ELEM_SIZE: usize = 2;
+pub const SLOT_ELEM_SIZE: usize = 2;
 
 /// Size of any page in smol-db.
 /// (we don't have true slotted page architecture)
@@ -34,12 +36,12 @@ impl Page {
 }
 
 /// Fixed size of an internal cell (key + file_index).
-pub const INTERNAL_CELL_SIZE: usize = 4 + 8;
+pub const INDEX_ENTRY_SIZE: usize = 4 + 8;
 
 /// Fixed size of a leaf cell metadata (key + deleted + value_size).
 /// # Note
 /// The actual bytes are appended after this.
-pub const LEAF_CELL_META_SIZE: usize = 4 + 1 + 4;
+pub const RECORD_META_SIZE: usize = 4 + 1 + 4;
 
 /// Maximum allowed size of a value. Larger values than 400 will be rejected;
 /// what is this? a real database (¬_¬)?
@@ -71,38 +73,38 @@ pub enum NodeType {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct InternalCell {
+pub struct IndexEntry {
     pub key: u32,
-    pub child_index: u64,
+    pub child_page_id: u64,
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct LeafCell {
+pub struct Record {
     pub key: u32,
-    pub deleted: bool,
-    pub value: Vec<u8>,
+    pub data: Vec<u8>,
+    pub is_deleted: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct InternalNode {
-    pub file_index: u64,
+    pub page_id: u64,
     pub last_lsn: u64,
-    pub right_index: u64,
-    pub indices: Vec<u16>,
-    pub cells: Vec<InternalCell>,
+    pub rightmost_child: u64,
+    pub slot_array: Vec<u16>,
+    pub entries: Vec<IndexEntry>,
     pub free_size: u16,
 }
 
 #[derive(Debug, Clone)]
 pub struct LeafNode {
-    pub file_index: u64,
+    pub page_id: u64,
     pub last_lsn: u64,
-    pub has_lsib: bool,
-    pub has_rsib: bool,
-    pub lsib_index: u64,
-    pub rsib_index: u64,
-    pub indices: Vec<u16>,
-    pub cells: Vec<LeafCell>,
+    pub has_prev: bool,
+    pub has_next: bool,
+    pub prev_page_id: u64,
+    pub next_page_id: u64,
+    pub slot_array: Vec<u16>,
+    pub records: Vec<Record>,
     pub free_size: u16,
 }
 
@@ -214,24 +216,28 @@ impl BTreeNode {
                 let free_size = cursor.read_u16();
                 cursor.pos += free_size as usize;
 
-                let mut cells = vec![LeafCell::default(); cell_count as usize];
+                let mut cells = vec![Record::default(); cell_count as usize];
 
                 for &cell_idx in indices.iter().take(cell_count as usize) {
                     let key = cursor.read_u32();
                     let deleted = cursor.read_u8() != 0;
                     let size = cursor.read_u32() as usize;
                     let value = cursor.read_bytes(size);
-                    cells[cell_idx as usize] = LeafCell { key, deleted, value };
+                    cells[cell_idx as usize] = Record {
+                        key,
+                        is_deleted: deleted,
+                        data: value,
+                    };
                 }
                 Ok(BTreeNode::Leaf(LeafNode {
-                    file_index,
+                    page_id: file_index,
                     last_lsn,
-                    has_lsib,
-                    has_rsib,
-                    lsib_index,
-                    rsib_index,
-                    indices,
-                    cells,
+                    has_prev: has_lsib,
+                    has_next: has_rsib,
+                    prev_page_id: lsib_index,
+                    next_page_id: rsib_index,
+                    slot_array: indices,
+                    records: cells,
                     free_size,
                 }))
             }
@@ -249,19 +255,22 @@ impl BTreeNode {
                 let free_size = cursor.read_u16();
                 cursor.pos += free_size as usize;
 
-                let mut cells = vec![InternalCell::default(); cell_count as usize];
+                let mut cells = vec![IndexEntry::default(); cell_count as usize];
                 for &cell_idx in indices.iter().take(cell_count as usize) {
                     let key = cursor.read_u32();
                     let child_index = cursor.read_u64();
 
-                    cells[cell_idx as usize] = InternalCell { key, child_index };
+                    cells[cell_idx as usize] = IndexEntry {
+                        key,
+                        child_page_id: child_index,
+                    };
                 }
                 Ok(BTreeNode::Internal(InternalNode {
-                    file_index,
+                    page_id: file_index,
                     last_lsn,
-                    right_index,
-                    indices,
-                    cells,
+                    rightmost_child: right_index,
+                    slot_array: indices,
+                    entries: cells,
                     free_size,
                 }))
             }
@@ -273,13 +282,13 @@ impl BTreeNode {
         let mut cursor = ByteCursor::new(page.as_bytes_mut());
         match self {
             BTreeNode::Leaf(node) => {
-                let header_len = LEAF_NODE_HEADER_SIZE + (node.indices.len() * OFFSET_ELEM_SIZE);
+                let header_len = LEAF_NODE_HEADER_SIZE + (node.slot_array.len() * SLOT_ELEM_SIZE);
                 let footer_len: usize = node
-                    .indices
+                    .slot_array
                     .iter()
                     .map(|&cell_idx| {
-                        let cell = &node.cells[cell_idx as usize];
-                        LEAF_CELL_META_SIZE + cell.value.len()
+                        let cell = &node.records[cell_idx as usize];
+                        RECORD_META_SIZE + cell.data.len()
                     })
                     .sum();
                 if header_len + footer_len > PAGE_SIZE {
@@ -288,32 +297,32 @@ impl BTreeNode {
                 let free_size = (PAGE_SIZE - header_len - footer_len) as u16;
 
                 cursor.write_u8(NodeType::Leaf as u8);
-                cursor.write_u64(node.file_index);
+                cursor.write_u64(node.page_id);
                 cursor.write_u64(node.last_lsn);
-                cursor.write_u8(node.has_lsib as u8);
-                cursor.write_u8(node.has_rsib as u8);
-                cursor.write_u64(node.lsib_index);
-                cursor.write_u64(node.rsib_index);
+                cursor.write_u8(node.has_prev as u8);
+                cursor.write_u8(node.has_next as u8);
+                cursor.write_u64(node.prev_page_id);
+                cursor.write_u64(node.next_page_id);
 
-                cursor.write_u32(node.indices.len() as u32);
-                for &index in &node.indices {
+                cursor.write_u32(node.slot_array.len() as u32);
+                for &index in &node.slot_array {
                     cursor.write_u16(index);
                 }
                 cursor.write_u16(free_size);
                 cursor.pos += free_size as usize;
 
-                for &index in &node.indices {
-                    let cell = &node.cells[index as usize];
+                for &index in &node.slot_array {
+                    let cell = &node.records[index as usize];
                     cursor.write_u32(cell.key);
-                    cursor.write_u8(cell.deleted as u8);
-                    cursor.write_u32(cell.value.len() as u32);
-                    cursor.write_bytes(&cell.value);
+                    cursor.write_u8(cell.is_deleted as u8);
+                    cursor.write_u32(cell.data.len() as u32);
+                    cursor.write_bytes(&cell.data);
                 }
             }
             BTreeNode::Internal(node) => {
                 let header_len =
-                    INTERNAL_NODE_HEADER_SIZE + (node.indices.len() * OFFSET_ELEM_SIZE);
-                let footer_len = node.indices.len() * INTERNAL_CELL_SIZE;
+                    INTERNAL_NODE_HEADER_SIZE + (node.slot_array.len() * SLOT_ELEM_SIZE);
+                let footer_len = node.slot_array.len() * INDEX_ENTRY_SIZE;
 
                 if header_len + footer_len > PAGE_SIZE {
                     return Err(DbError::PageFull);
@@ -321,24 +330,49 @@ impl BTreeNode {
                 let free_size = (PAGE_SIZE - header_len - footer_len) as u16;
 
                 cursor.write_u8(NodeType::Internal as u8);
-                cursor.write_u64(node.file_index);
+                cursor.write_u64(node.page_id);
                 cursor.write_u64(node.last_lsn);
-                cursor.write_u64(node.right_index);
+                cursor.write_u64(node.rightmost_child);
 
-                cursor.write_u32(node.indices.len() as u32);
-                for &offset in &node.indices {
+                cursor.write_u32(node.slot_array.len() as u32);
+                for &offset in &node.slot_array {
                     cursor.write_u16(offset);
                 }
                 cursor.write_u16(free_size);
                 cursor.pos += free_size as usize;
 
-                for &offset in &node.indices {
-                    let cell = &node.cells[offset as usize];
+                for &offset in &node.slot_array {
+                    let cell = &node.entries[offset as usize];
                     cursor.write_u32(cell.key);
-                    cursor.write_u64(cell.child_index);
+                    cursor.write_u64(cell.child_page_id);
                 }
             }
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct FileHeader {
+    pub last_row_id: u32,
+    pub page_root_offset: u64,
+    pub next_lsn: u64,
+    pub next_free_offset: u64,
+}
+
+impl Default for FileHeader {
+    fn default() -> Self {
+        Self {
+            last_row_id: 0,
+            page_root_offset: 0,
+            next_lsn: 0,
+            next_free_offset: PAGE_SIZE as u64,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DiskManager {
+    file: File,
+    pub header: FileHeader,
 }
