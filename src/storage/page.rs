@@ -1,4 +1,8 @@
-use std::fs::File;
+use std::{
+    fs::{File, OpenOptions},
+    os::unix::fs::FileExt,
+    path::Path,
+};
 
 use crate::error::DbError;
 
@@ -375,4 +379,64 @@ impl Default for FileHeader {
 pub struct DiskManager {
     file: File,
     pub header: FileHeader,
+}
+
+impl DiskManager {
+    pub fn new<P>(path: P) -> Result<Self, DbError>
+    where
+        P: AsRef<Path>,
+    {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
+
+        let mut header = FileHeader::default();
+        let metadata = file.metadata()?;
+
+        if metadata.len() <= 0 {
+            return Ok(Self { file, header });
+        }
+        let mut buffer = [0u8; 28];
+
+        file.read_exact_at(&mut buffer, 0)?;
+
+        header.last_row_id = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
+        header.page_root_offset = u64::from_le_bytes(buffer[4..12].try_into().unwrap());
+        header.next_lsn = u64::from_le_bytes(buffer[12..20].try_into().unwrap());
+        header.next_free_offset = u64::from_le_bytes(buffer[20..28].try_into().unwrap());
+
+        Ok(Self { file, header })
+    }
+
+    pub fn read_page(&self, page_id: &PageId) -> Result<Page, DbError> {
+        let mut page = Page::new();
+        self.file
+            .read_exact_at(page.as_bytes_mut(), page_id.0)?;
+        Ok(page)
+    }
+
+    pub fn write_page(&self, page_id: PageId, page: &Page) -> Result<(), DbError> {
+        self.file
+            .write_all_at(page.as_bytes(), page_id.0)?;
+        Ok(())
+    }
+
+    pub fn allocate_page(&mut self) -> PageId {
+        let new_page_id = PageId(self.header.next_free_offset);
+        self.header.next_free_offset += PAGE_SIZE as u64;
+        new_page_id
+    }
+
+    pub fn save_header(&self) -> Result<(), DbError> {
+        let mut buffer = [0u8; 28];
+        buffer[0..4].copy_from_slice(&self.header.last_row_id.to_le_bytes());
+        buffer[4..12].copy_from_slice(&self.header.page_root_offset.to_le_bytes());
+        buffer[12..20].copy_from_slice(&self.header.next_lsn.to_le_bytes());
+        buffer[20..28].copy_from_slice(&self.header.next_free_offset.to_le_bytes());
+        self.file.write_all_at(&buffer, 0)?;
+        self.file.sync_all()?;
+        Ok(())
+    }
 }
