@@ -397,7 +397,7 @@ impl DiskManager {
         let metadata = file.metadata()?;
 
         if metadata.len() > 0 {
-            let mut buffer = [0u8; 28]; // 4 + 8 + 8 + 8 = 24
+            let mut buffer = [0u8; 28]; // 4 + 8 + 8 + 8 = 28
             file.read_exact_at(&mut buffer, 0)?;
 
             header.last_row_id = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
