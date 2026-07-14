@@ -1,5 +1,4 @@
 use std::{
-    cmp::Ordering,
     fs::{File, OpenOptions},
     os::unix::fs::FileExt,
     path::Path,
@@ -388,25 +387,23 @@ impl DiskManager {
         P: AsRef<Path>,
     {
         let file = OpenOptions::new()
-            .create(true)
             .read(true)
             .write(true)
+            .create(true)
+            .truncate(false)
             .open(path)?;
 
         let mut header = FileHeader::default();
         let metadata = file.metadata()?;
 
-        match metadata.len().cmp(&0) {
-            Ordering::Greater => {
-                let mut buffer = [0u8; 28]; // 4 + 8 + 8 + 8 = 24
-                file.read_exact_at(&mut buffer, 0)?;
+        if metadata.len() > 0 {
+            let mut buffer = [0u8; 28]; // 4 + 8 + 8 + 8 = 24
+            file.read_exact_at(&mut buffer, 0)?;
 
-                header.last_row_id = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
-                header.page_root_offset = u64::from_le_bytes(buffer[4..12].try_into().unwrap());
-                header.next_lsn = u64::from_le_bytes(buffer[12..20].try_into().unwrap());
-                header.next_free_offset = u64::from_le_bytes(buffer[20..28].try_into().unwrap());
-            }
-            _ => {}
+            header.last_row_id = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
+            header.page_root_offset = u64::from_le_bytes(buffer[4..12].try_into().unwrap());
+            header.next_lsn = u64::from_le_bytes(buffer[12..20].try_into().unwrap());
+            header.next_free_offset = u64::from_le_bytes(buffer[20..28].try_into().unwrap());
         }
         Ok(Self { file, header })
     }
