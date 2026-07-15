@@ -14,7 +14,7 @@ pub const SLOT_ELEM_SIZE: usize = 2;
 pub const PAGE_SIZE: usize = 4096;
 
 /// Identifier for a physical file offset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageId(pub u64);
 
 /// An owned, 4KB buffer representing a physical slotted page.
@@ -89,9 +89,9 @@ pub struct Record {
     pub is_deleted: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct InternalNode {
-    pub page_id: u64,
+    pub page_id: PageId,
     pub last_lsn: u64,
     pub rightmost_child: u64,
     pub slot_array: Vec<u16>,
@@ -103,9 +103,9 @@ pub struct InternalNode {
     pub is_dirty: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct LeafNode {
-    pub page_id: u64,
+    pub page_id: PageId,
     pub last_lsn: u64,
     pub has_prev: bool,
     pub has_next: bool,
@@ -127,6 +127,21 @@ pub enum BTreeNode {
 }
 
 impl BTreeNode {
+    pub fn new_empty(page_id: PageId, is_leaf: bool) -> Self {
+        if is_leaf {
+            let leaf_node = LeafNode {
+                page_id,
+                ..Default::default()
+            };
+            return Self::Leaf(leaf_node);
+        }
+        let internal_node = InternalNode {
+            page_id,
+            ..Default::default()
+        };
+        Self::Internal(internal_node)
+    }
+
     /// Returns true if the node has been modified in memory since being loaded
     /// from disk.
     pub fn is_dirty(&self) -> bool {
@@ -289,7 +304,7 @@ impl BTreeNode {
                     };
                 }
                 Ok(BTreeNode::Leaf(LeafNode {
-                    page_id: file_index,
+                    page_id: PageId(file_index),
                     last_lsn,
                     has_prev: has_lsib,
                     has_next: has_rsib,
@@ -326,7 +341,7 @@ impl BTreeNode {
                     };
                 }
                 Ok(BTreeNode::Internal(InternalNode {
-                    page_id: file_index,
+                    page_id: PageId(file_index),
                     last_lsn,
                     rightmost_child: right_index,
                     slot_array: indices,
@@ -358,7 +373,7 @@ impl BTreeNode {
                 let free_size = (PAGE_SIZE - header_len - footer_len) as u16;
 
                 cursor.write_u8(NodeType::Leaf as u8);
-                cursor.write_u64(node.page_id);
+                cursor.write_u64(node.page_id.0);
                 cursor.write_u64(node.last_lsn);
                 cursor.write_u8(node.has_prev as u8);
                 cursor.write_u8(node.has_next as u8);
@@ -391,7 +406,7 @@ impl BTreeNode {
                 let free_size = (PAGE_SIZE - header_len - footer_len) as u16;
 
                 cursor.write_u8(NodeType::Internal as u8);
-                cursor.write_u64(node.page_id);
+                cursor.write_u64(node.page_id.0);
                 cursor.write_u64(node.last_lsn);
                 cursor.write_u64(node.rightmost_child);
 
@@ -547,7 +562,7 @@ mod tests {
     #[test]
     fn test_empty_leaf_node_round_trip() -> Result<(), Box<dyn Error>> {
         let leaf = LeafNode {
-            page_id: 1,
+            page_id: PageId(1),
             last_lsn: 100,
             has_prev: false,
             has_next: false,
@@ -592,7 +607,7 @@ mod tests {
         ];
 
         let leaf = LeafNode {
-            page_id: 42,
+            page_id: PageId(42),
             last_lsn: 999,
             has_prev: true,
             has_next: true,
@@ -610,7 +625,7 @@ mod tests {
 
         let decoded = BTreeNode::decode(&page)?;
         if let BTreeNode::Leaf(dec_leaf) = decoded {
-            assert_eq!(dec_leaf.page_id, 42);
+            assert_eq!(dec_leaf.page_id, PageId(42));
             assert_eq!(dec_leaf.prev_page_id, 41);
             assert_eq!(dec_leaf.next_page_id, 43);
             assert_eq!(dec_leaf.slot_array, vec![0, 1, 2]);
@@ -642,7 +657,7 @@ mod tests {
         }
 
         let leaf = LeafNode {
-            page_id: 1,
+            page_id: PageId(1),
             last_lsn: 0,
             has_prev: false,
             has_next: false,
@@ -679,7 +694,7 @@ mod tests {
         ];
 
         let internal = InternalNode {
-            page_id: 1,
+            page_id: PageId(1),
             last_lsn: 555,
             rightmost_child: 5,
             slot_array: vec![0, 1, 2],
@@ -693,7 +708,7 @@ mod tests {
 
         let decoded = BTreeNode::decode(&page)?;
         if let BTreeNode::Internal(dec_internal) = decoded {
-            assert_eq!(dec_internal.page_id, 1);
+            assert_eq!(dec_internal.page_id, PageId(1));
             assert_eq!(dec_internal.last_lsn, 555);
             assert_eq!(dec_internal.rightmost_child, 5);
             assert_eq!(dec_internal.slot_array.len(), 3);
@@ -730,7 +745,7 @@ mod tests {
         // Encode a leaf node onto page 1
         let mut page_1 = Page::new();
         let leaf = LeafNode {
-            page_id: page_id_1.0,
+            page_id: page_id_1,
             last_lsn: 10,
             has_prev: false,
             has_next: false,
