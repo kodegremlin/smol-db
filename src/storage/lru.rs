@@ -121,7 +121,7 @@ impl LruReplacer {
             self.head = next_idx;
         }
         if let Some(n_idx) = next_idx {
-            self.arena[n_idx].next = prev_idx;
+            self.arena[n_idx].prev = prev_idx;
         } else {
             // If there is no next node, this node was the tail.
             self.tail = prev_idx;
