@@ -50,6 +50,11 @@ impl LruReplacer {
         }
     }
 
+    /// Returns the size of the current cache.
+    pub fn size(&self) -> usize {
+        self.pages.len()
+    }
+
     /// Records that a page was accessed, making it the most recently used.
     /// If the page is new, a new node is pushed into the arena, at either
     /// a free_idx or at the last index.
