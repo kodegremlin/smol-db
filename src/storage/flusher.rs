@@ -49,20 +49,20 @@ impl BackgroundFlusher {
                         break;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if let Ok(mut pool_guard) = pool.lock() {
-                            if let Err(err) = pool_guard.flush_all_pages() {
-                                eprintln!("Background flusher encountered an error: {:?}", err);
-                            }
+                        if let Ok(mut pool_guard) = pool.lock()
+                            && let Err(err) = pool_guard.flush_all_pages()
+                        {
+                            eprintln!("Background flusher encountered an error: {:?}", err);
                         }
                     }
                 }
             }
             // Final flush to ensure durability; if we recieve a signal before
             // timeout.
-            if let Ok(mut pool_guard) = pool.lock() {
-                if let Err(err) = pool_guard.flush_all_pages() {
-                    eprintln!("Failed final background flush on shutdown: {:?}", err);
-                }
+            if let Ok(mut pool_guard) = pool.lock()
+                && let Err(err) = pool_guard.flush_all_pages()
+            {
+                eprintln!("Failed final background flush on shutdown: {:?}", err);
             }
         });
         Self {
