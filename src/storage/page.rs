@@ -97,6 +97,10 @@ pub struct InternalNode {
     pub slot_array: Vec<u16>,
     pub entries: Vec<IndexEntry>,
     pub free_size: u16,
+
+    /// Tracks if the node was modified in memory. Excluded from encoding
+    /// decoding.
+    pub is_dirty: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -110,12 +114,63 @@ pub struct LeafNode {
     pub slot_array: Vec<u16>,
     pub records: Vec<Record>,
     pub free_size: u16,
+
+    /// Tracks if the node was modified in memory. Excluded from encoding
+    /// decoding.
+    pub is_dirty: bool,
 }
 
 #[derive(Debug, Clone)]
 pub enum BTreeNode {
     Internal(InternalNode),
     Leaf(LeafNode),
+}
+
+impl BTreeNode {
+    /// Returns true if the node has been modified in memory since being loaded
+    /// from disk.
+    pub fn is_dirty(&self) -> bool {
+        use BTreeNode::*;
+        match self {
+            Internal(node) => node.is_dirty,
+            Leaf(node) => node.is_dirty,
+        }
+    }
+
+    /// Clears the dirty flag, signifying the node to be unmodified. Must be
+    /// called immediately after the Buffer Pool successfully write the page
+    /// to the disk.
+    pub fn clear_dirty(&mut self) {
+        use BTreeNode::*;
+        match self {
+            Internal(node) => node.is_dirty = false,
+            Leaf(node) => node.is_dirty = false,
+        }
+    }
+
+    /// Marks the node as dirty :) hehe, and updates its last (LSN).
+    pub fn mark_dirty(&mut self, lsn: u64) {
+        use BTreeNode::*;
+        match self {
+            Internal(node) => {
+                node.last_lsn = lsn;
+                node.is_dirty = true;
+            }
+            Leaf(node) => {
+                node.last_lsn = lsn;
+                node.is_dirty = true;
+            }
+        }
+    }
+
+    /// Returns the LSN of the last update applied to this node.
+    pub fn get_last_lsn(&self) -> u64 {
+        use BTreeNode::*;
+        match self {
+            Internal(node) => node.last_lsn,
+            Leaf(node) => node.last_lsn,
+        }
+    }
 }
 
 /// A minimal helper to safely read/write bytes to our 4KB array sequentially.
@@ -243,6 +298,7 @@ impl BTreeNode {
                     slot_array: indices,
                     records: cells,
                     free_size,
+                    is_dirty: false,
                 }))
             }
             // InternalNode
@@ -276,6 +332,7 @@ impl BTreeNode {
                     slot_array: indices,
                     entries: cells,
                     free_size,
+                    is_dirty: false,
                 }))
             }
             val => Err(DbError::CorruptPage(format!("Unknown node type: {}", val))),
@@ -499,6 +556,7 @@ mod tests {
             slot_array: vec![],
             records: vec![],
             free_size: 0, // Will be recalculated during encode
+            is_dirty: false,
         };
 
         let mut page = Page::new();
@@ -544,6 +602,7 @@ mod tests {
             slot_array: vec![0, 1, 2],
             records: records.clone(),
             free_size: 0,
+            is_dirty: false,
         };
 
         let mut page = Page::new();
@@ -592,6 +651,7 @@ mod tests {
             slot_array,
             records,
             free_size: 0,
+            is_dirty: false,
         };
 
         let mut page = Page::new();
@@ -625,6 +685,7 @@ mod tests {
             slot_array: vec![0, 1, 2],
             entries: entries.clone(),
             free_size: 0,
+            is_dirty: false,
         };
 
         let mut page = Page::new();
@@ -678,6 +739,7 @@ mod tests {
             slot_array: vec![0],
             records: vec![make_record(1, b"disk-test", false)],
             free_size: 0,
+            is_dirty: false,
         };
         BTreeNode::Leaf(leaf).encode(&mut page_1)?;
         dm.write_page(page_id_1, &page_1)?;
