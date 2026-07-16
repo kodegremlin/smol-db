@@ -59,6 +59,7 @@ impl BufferPool {
         Ok(page_ref)
     }
 
+    /// Allocates a completely new page via the `DiskManager` and adds it to the pool.
     pub fn new_page(&mut self, is_leaf: bool) -> Result<(PageId, PageRef), DbError> {
         if self.page_table.len() >= self.capacity {
             self.evict_page()?;

@@ -8,3 +8,7 @@ A simplified version of a relational database, built for educational purposes.
 
 ## Status
 Under construction.
+
+## Future Considerations 
+1. See if LRU-K can be used instead of simple arena based LRU (current), given our architectural simplifications.
+2. Improve background flusher to use latch-crabbing instead of complete buffer-pool lock while flushing pages.
