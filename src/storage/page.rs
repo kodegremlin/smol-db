@@ -520,7 +520,8 @@ mod tests {
     use std::fs::remove_file;
     use std::time::SystemTime;
 
-    /// Helper to generate a unique temporary file path for concurrent DiskManager tests.
+    /// Helper to generate a unique temporary file path for concurrent DiskManager
+    /// tests.
     fn temp_db_path(test_name: &str) -> String {
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -538,7 +539,8 @@ mod tests {
         }
     }
 
-    /// Verifies that ByteCursor correctly reads and writes mixed endian integers and slices sequentially.
+    /// Verifies that ByteCursor correctly reads and writes mixed endian integers
+    /// and slices sequentially.
     #[test]
     fn test_byte_cursor_primitives() {
         let mut buffer = [0u8; 64];
@@ -558,7 +560,8 @@ mod tests {
         assert_eq!(read_cursor.read_bytes(7), b"smol-db");
     }
 
-    /// Validates round-trip encoding and decoding of an empty LeafNode without siblings.
+    /// Validates round-trip encoding and decoding of an empty LeafNode without
+    /// siblings.
     #[test]
     fn test_empty_leaf_node_round_trip() -> Result<(), Box<dyn Error>> {
         let leaf = LeafNode {
@@ -597,7 +600,8 @@ mod tests {
         Ok(())
     }
 
-    /// Verifies round-trip encoding of a LeafNode containing multiple records, including deleted flags and sibling pointers.
+    /// Verifies round-trip encoding of a LeafNode containing multiple records,
+    /// including deleted flags and sibling pointers.
     #[test]
     fn test_populated_leaf_node_round_trip() -> Result<(), Box<dyn Error>> {
         let records = vec![
@@ -651,11 +655,11 @@ mod tests {
         // Create 11 records of 400 bytes each (11 * 400 = 4400 bytes > 4096 PAGE_SIZE)
         let mut records = Vec::new();
         let mut slot_array = Vec::new();
+
         for i in 0..11 {
             records.push(make_record(i, &[0u8; MAX_VALUE_SIZE], false));
             slot_array.push(i as u16);
         }
-
         let leaf = LeafNode {
             page_id: PageId(1),
             last_lsn: 0,
@@ -668,14 +672,14 @@ mod tests {
             free_size: 0,
             is_dirty: false,
         };
-
         let mut page = Page::new();
-        let result = BTreeNode::Leaf(leaf).encode(&mut page);
 
+        let result = BTreeNode::Leaf(leaf).encode(&mut page);
         assert!(matches!(result, Err(DbError::PageFull)));
     }
 
-    /// Validates round-trip encoding and decoding of an InternalNode with routing keys and child pointers.
+    /// Validates round-trip encoding and decoding of an InternalNode with routing
+    /// keys and child pointers.
     #[test]
     fn test_internal_node_round_trip() -> Result<(), Box<dyn Error>> {
         let entries = vec![
@@ -692,7 +696,6 @@ mod tests {
                 child_page_id: 4,
             },
         ];
-
         let internal = InternalNode {
             page_id: PageId(1),
             last_lsn: 555,
@@ -702,7 +705,6 @@ mod tests {
             free_size: 0,
             is_dirty: false,
         };
-
         let mut page = Page::new();
         BTreeNode::Internal(internal).encode(&mut page)?;
 
@@ -717,11 +719,11 @@ mod tests {
         } else {
             panic!("Expected BTreeNode::Internal");
         }
-
         Ok(())
     }
 
-    /// Ensures decoding a page with an invalid magic byte returns a CorruptPage error variant.
+    /// Ensures decoding a page with an invalid magic byte returns a CorruptPage
+    /// error variant.
     #[test]
     fn test_decode_corrupt_node_type_fails() {
         let mut page = Page::new();
@@ -731,7 +733,8 @@ mod tests {
         assert!(matches!(result, Err(DbError::CorruptPage(_))));
     }
 
-    /// Verifies end-to-end persistence: allocating, writing, and reading pages via DiskManager.
+    /// Verifies end-to-end persistence: allocating, writing, and reading pages
+    /// via DiskManager.
     #[test]
     fn test_disk_manager_page_lifecycle() -> Result<(), Box<dyn Error>> {
         let path = temp_db_path("disk_manager_lifecycle");
@@ -762,22 +765,21 @@ mod tests {
         // Read page 1 back from disk and decode
         let read_page = dm.read_page(&page_id_1)?;
         let decoded = BTreeNode::decode(&read_page)?;
+
         if let BTreeNode::Leaf(dec_leaf) = decoded {
             assert_eq!(dec_leaf.records[0].data, b"disk-test");
         } else {
             panic!("Failed to decode written leaf page from DiskManager");
         }
-
-        // Clean up temporary artifact
         remove_file(path)?;
         Ok(())
     }
 
-    /// Validates that DiskManager correctly persists and restores the 28-byte FileHeader across file reopens.
+    /// Validates that DiskManager correctly persists and restores the 28-byte
+    /// FileHeader across file reopens.
     #[test]
     fn test_disk_manager_header_persistence() -> Result<(), Box<dyn Error>> {
         let path = temp_db_path("header_persistence");
-
         {
             let mut dm = DiskManager::new(&path)?;
             dm.header.last_row_id = 42;
@@ -785,9 +787,7 @@ mod tests {
             dm.header.next_lsn = 1000;
             dm.header.next_free_offset = 16384;
             dm.save_header()?;
-        } // Drop file handle
-
-        // Reopen disk manager on the existing file
+        }
         let dm_reopened = DiskManager::new(&path)?;
         assert_eq!(dm_reopened.header.last_row_id, 42);
         assert_eq!(dm_reopened.header.page_root_offset, 8192);

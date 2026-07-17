@@ -153,14 +153,16 @@ mod tests {
     use super::*;
     use crate::storage::page::PageId;
 
-    /// Validates that an empty replacer correctly returns `None` on eviction without panicking.
+    /// Validates that an empty replacer correctly returns `None` on eviction
+    /// without panicking.
     #[test]
     fn test_empty_replacer_evicts_none() {
         let mut lru = LruReplacer::new(5);
         assert_eq!(lru.evict(), None);
     }
 
-    /// Verifies the core LRU invariant: pages are evicted in the exact order they were first accessed.
+    /// Verifies the core LRU invariant: pages are evicted in the exact order
+    /// they were first accessed.
     #[test]
     fn test_lru_eviction_ordering() {
         let mut lru = LruReplacer::new(3);
@@ -174,7 +176,8 @@ mod tests {
         assert_eq!(lru.evict(), None);
     }
 
-    /// Ensures accessing an already-tracked page promotes it to MRU (head), protecting it from eviction.
+    /// Ensures accessing an already-tracked page promotes it to MRU (head),
+    /// protecting it from eviction.
     #[test]
     fn test_record_access_promotes_to_mru() {
         let mut lru = LruReplacer::new(3);
@@ -191,7 +194,8 @@ mod tests {
         assert_eq!(lru.evict(), None);
     }
 
-    /// Validates boundary pointer rewires when removing head, tail, or middle nodes explicitly.
+    /// Validates boundary pointer rewires when removing head, tail, or middle
+    /// nodes explicitly.
     #[test]
     fn test_explicit_remove() {
         let mut lru = LruReplacer::new(4);
@@ -212,7 +216,8 @@ mod tests {
         assert_eq!(lru.evict(), None);
     }
 
-    /// Ensures that removing a non-existent PageId is a safe no-op that does not corrupt pointers.
+    /// Ensures that removing a non-existent PageId is a safe no-op that does
+    /// not corrupt pointers.
     #[test]
     fn test_remove_nonexistent_page_is_noop() {
         let mut lru = LruReplacer::new(2);
@@ -223,7 +228,8 @@ mod tests {
         assert_eq!(lru.evict(), None);
     }
 
-    /// Verifies arena memory reuse: evicted slots must be pushed to `free_list` and reused by new pages.
+    /// Verifies arena memory reuse: evicted slots must be pushed to `free_list`
+    /// and reused by new pages.
     #[test]
     fn test_arena_slot_reuse_via_free_list() {
         let mut lru = LruReplacer::new(3);
@@ -241,7 +247,7 @@ mod tests {
         assert!(lru.free_list.is_empty());
     }
 
-    /// Tests extreme boundary condition of a single-capacity buffer pool.
+    /// Tests boundary condition of a single-capacity buffer pool.
     #[test]
     fn test_single_capacity_boundaries() {
         let mut lru = LruReplacer::new(1);
@@ -256,7 +262,8 @@ mod tests {
         assert_eq!(lru.tail, None);
     }
 
-    /// Validates that exceeding capacity without evicting triggers the expected defensive panic.
+    /// Validates that exceeding capacity without evicting triggers the expected
+    /// defensive panic.
     #[test]
     #[should_panic(
         expected = "Buffer Pool exceeded capacity! Must call evict() before adding new pages."

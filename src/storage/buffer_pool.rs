@@ -102,8 +102,8 @@ impl BufferPool {
         Ok(())
     }
 
-    /// Internal method to find a page that can be evicted, flush it if dirty, and
-    /// remove it from memory.
+    /// Find a page that can be evicted, flush it if dirty, and remove it from
+    /// memory.
     fn evict_page(&mut self) -> Result<(), DbError> {
         // Attempt to find an unpinned victim page.
         // If strong_count > 1, the storage engine is actively using it (pinned).
