@@ -23,13 +23,13 @@ pub struct LruReplacer {
     arena: Vec<LruNode>,
 
     /// Index of the most recently used node.
-    head: Option<usize>,
+    head_idx: Option<usize>,
 
     /// Index of the least recently used node (the eviction
     /// candidate).
-    tail: Option<usize>,
+    tail_idx: Option<usize>,
 
-    /// Maximum number of pages the replacer is allowed to track.
+    /// Maximum number of pages the cache is allowed to track.
     capacity: usize,
 
     /// Tracks indices of nodes that have been removed, allowing
@@ -43,8 +43,8 @@ impl LruReplacer {
         Self {
             pages: HashMap::with_capacity(capacity),
             arena: Vec::with_capacity(capacity),
-            head: None,
-            tail: None,
+            head_idx: None,
+            tail_idx: None,
             capacity,
             free_list: Vec::with_capacity(capacity),
         }
@@ -59,7 +59,7 @@ impl LruReplacer {
     /// If the page is new, a new node is pushed into the arena, at either
     /// a free_idx or at the last index.
     ///
-    /// Panics if the replacer exceeds capacity without the [BufferPool]
+    /// Panics if the cache exceeds capacity without the [BufferPool]
     /// evicting first.
     pub fn record_access(&mut self, page_id: PageId) {
         if let Some(&idx) = self.pages.get(&page_id) {
@@ -103,15 +103,15 @@ impl LruReplacer {
     /// Inserts a node at the head (most recently used) position.
     fn insert_head(&mut self, idx: usize) {
         self.arena[idx].prev = None;
-        self.arena[idx].next = self.head;
+        self.arena[idx].next = self.head_idx;
 
-        if let Some(h_idx) = self.head {
+        if let Some(h_idx) = self.head_idx {
             self.arena[h_idx].prev = Some(idx);
         } else {
             // If there is no head, the list was empty; this node is also the tail.
-            self.tail = Some(idx);
+            self.tail_idx = Some(idx);
         }
-        self.head = Some(idx)
+        self.head_idx = Some(idx)
     }
 
     /// Unlinks a node from its current position in the linked list.
@@ -123,21 +123,23 @@ impl LruReplacer {
             self.arena[p_idx].next = next_idx;
         } else {
             // If there is no prev node, this node was the head.
-            self.head = next_idx;
+            self.head_idx = next_idx;
         }
         if let Some(n_idx) = next_idx {
             self.arena[n_idx].prev = prev_idx;
         } else {
             // If there is no next node, this node was the tail.
-            self.tail = prev_idx;
+            self.tail_idx = prev_idx;
         }
     }
 
-    /// Removes and returns the least recently used `PageId` from the replacer.
-    /// The caller, [BufferPool] is responsible for safely flushing dirty data.
-    /// Returns `None` if the replacer is empty.
+    /// Removes and returns the least recently used `PageId` from the Lru cache.
+    /// Returns `None` if the cache is empty.
+    ///
+    /// # Caution
+    /// Could be removed later from the API.
     pub fn evict(&mut self) -> Option<PageId> {
-        let t_idx = self.tail?;
+        let t_idx = self.tail_idx?;
         let page_id = self.arena[t_idx].page_id;
 
         self.unlink(t_idx);
@@ -145,6 +147,49 @@ impl LruReplacer {
         self.free_list.push(t_idx);
 
         Some(page_id)
+    }
+
+    /// Yields up to `limit` PageIds from the Lru tail without unlinking them or
+    /// modifying their recency position.
+    pub fn peek_rev(&self, limit: usize) -> Vec<PageId> {
+        let mut candidates = Vec::with_capacity(limit);
+        let mut curr_idx = self.tail_idx;
+
+        while let Some(node_idx) = curr_idx {
+            if candidates.len() > limit {
+                break;
+            }
+            candidates.push(self.arena[node_idx].page_id);
+            curr_idx = self.arena[node_idx].prev;
+        }
+        candidates
+    }
+
+    /// Traverses the Lru list backward from least recently used (tail) to most
+    /// recently used (head) evaluating the predicate against each candidate
+    /// `PageId`.
+    ///
+    /// Unlinks and returns the first `PageId` that satisfies the predicate,
+    /// leaving all non-matching pages (such as pinned ones) in their exact
+    /// chronological recency position.
+    pub fn evict_if<F>(&mut self, mut predicate: F) -> Option<PageId>
+    where
+        F: FnMut(&PageId) -> bool,
+    {
+        let mut curr_idx = self.tail_idx;
+
+        while let Some(node_idx) = curr_idx {
+            let page_id = self.arena[node_idx].page_id;
+
+            if predicate(&page_id) {
+                self.unlink(node_idx);
+                self.pages.remove(&page_id);
+                self.free_list.push(node_idx);
+                return Some(page_id);
+            }
+            curr_idx = self.arena[node_idx].prev;
+        }
+        None
     }
 }
 
@@ -252,14 +297,14 @@ mod tests {
     fn test_single_capacity_boundaries() {
         let mut lru = LruReplacer::new(1);
         lru.record_access(PageId(100));
-        assert_eq!(lru.head, Some(0));
-        assert_eq!(lru.tail, Some(0));
+        assert_eq!(lru.head_idx, Some(0));
+        assert_eq!(lru.tail_idx, Some(0));
 
         // Re-accessing the single item shouldn't break head == tail
         lru.record_access(PageId(100));
         assert_eq!(lru.evict(), Some(PageId(100)));
-        assert_eq!(lru.head, None);
-        assert_eq!(lru.tail, None);
+        assert_eq!(lru.head_idx, None);
+        assert_eq!(lru.tail_idx, None);
     }
 
     /// Validates that exceeding capacity without evicting triggers the expected
