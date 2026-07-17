@@ -78,15 +78,15 @@ impl BufferPool {
     /// Flushes a specific page to disk if it is dirty.
     pub fn flush_page(&mut self, page_id: PageId) -> Result<(), DbError> {
         if let Some(page_ref) = self.page_table.get(&page_id) {
-            let mut node = page_ref
+            let mut node_guard = page_ref
                 .write()
                 .map_err(|_| DbError::CorruptPage("Poisoned lock".into()))?;
 
-            if node.is_dirty() {
+            if node_guard.is_dirty() {
                 let mut raw_page = Page::new();
-                node.encode(&mut raw_page)?;
+                node_guard.encode(&mut raw_page)?;
                 self.disk_manager.write_page(page_id, &raw_page)?;
-                node.clear_dirty();
+                node_guard.clear_dirty();
             }
         }
         Ok(())
