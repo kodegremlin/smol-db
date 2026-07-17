@@ -105,26 +105,18 @@ impl BufferPool {
     /// Find a page that can be evicted, flush it if dirty, and remove it from
     /// memory.
     fn evict_page(&mut self) -> Result<(), DbError> {
-        // Attempt to find an unpinned victim page.
-        // If strong_count > 1, the storage engine is actively using it (pinned).
-        let mut remove_id = None;
-
-        for _ in 0..self.replacer.size() {
-            if let Some(candidate_id) = self.replacer.evict() {
-                let Some(page_ref) = self.page_table.get(&candidate_id) else {
-                    panic!("page for candidate_id={} should be present", candidate_id.0);
-                };
-                if Arc::strong_count(page_ref) == 1 {
-                    remove_id = Some(candidate_id);
-                    break;
+        let evict_id = self
+            .replacer
+            .evict_if(|page_id| match self.page_table.get(page_id) {
+                Some(page_ref) => Arc::strong_count(page_ref) == 1,
+                None => {
+                    panic!(
+                        "LruReplacer contains PageId({:?}); should also be present in page_table",
+                        page_id
+                    );
                 }
-                // If it was pinned, put it back as recently used and try
-                // the next oldest.
-                self.replacer.record_access(candidate_id);
-            }
-        }
-        // The error should almost never be the case.
-        let evict_id = remove_id.ok_or(DbError::PageFull)?;
+            })
+            .ok_or(DbError::LruEviction)?;
 
         self.flush_page(evict_id)?;
         self.page_table.remove(&evict_id);
