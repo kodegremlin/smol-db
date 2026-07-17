@@ -527,7 +527,11 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        format!("/tmp/smol_db_test_{}_{}.db", test_name, timestamp)
+        // FIXME: provide a way to pass custom paths for testing, db-files, etc.
+        format!(
+            "/Volumes/External T7/smol_db_test_{}_{}.db",
+            test_name, timestamp
+        )
     }
 
     /// Helper to construct a dummy Record with arbitrary key and data payload.
