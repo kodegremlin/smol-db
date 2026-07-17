@@ -29,7 +29,7 @@ pub struct LruReplacer {
     /// candidate).
     tail_idx: Option<usize>,
 
-    /// Maximum number of pages the cache is allowed to track.
+    /// Maximum number of pages the replacer is allowed to track.
     capacity: usize,
 
     /// Tracks indices of nodes that have been removed, allowing
@@ -50,7 +50,7 @@ impl LruReplacer {
         }
     }
 
-    /// Returns the size of the current cache.
+    /// Returns the size of the current replacer.
     pub fn size(&self) -> usize {
         self.pages.len()
     }
@@ -59,7 +59,7 @@ impl LruReplacer {
     /// If the page is new, a new node is pushed into the arena, at either
     /// a free_idx or at the last index.
     ///
-    /// Panics if the cache exceeds capacity without the [BufferPool]
+    /// Panics if the replacer exceeds capacity without the [BufferPool]
     /// evicting first.
     pub fn record_access(&mut self, page_id: PageId) {
         if let Some(&idx) = self.pages.get(&page_id) {
@@ -133,8 +133,8 @@ impl LruReplacer {
         }
     }
 
-    /// Removes and returns the least recently used `PageId` from the Lru cache.
-    /// Returns `None` if the cache is empty.
+    /// Removes and returns the least recently used `PageId` from the Lru replacer.
+    /// Returns `None` if the replacer is empty.
     ///
     /// # Caution
     /// Could be removed later from the API.
