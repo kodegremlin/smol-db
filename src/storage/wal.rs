@@ -324,6 +324,7 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    #[test]
     fn test_wal_manager_torn_write_detection() {
         let path = get_temp_wal_path("torn_write");
 
