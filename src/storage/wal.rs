@@ -1,3 +1,9 @@
+use std::{
+    fs::{File, OpenOptions},
+    io::{BufReader, ErrorKind, Read, Seek, SeekFrom, Write},
+    path::Path,
+};
+
 use crate::{error::DbError, storage::page::PageId};
 
 /// Fixed size of the physical Wal entry header in bytes.
@@ -65,6 +71,11 @@ impl WalEntry {
         buffer
     }
 
+    /// Returns the size of the entire entry including the headers.
+    pub fn size(&self) -> usize {
+        WAL_ENTRY_HEADER_SIZE + self.payload.len()
+    }
+
     /// Deserialize a raw little-endian byte slice into a `WalEntry`.
     pub fn decode(buffer: &[u8]) -> Result<Self, DbError> {
         if buffer.len() < WAL_ENTRY_HEADER_SIZE {
@@ -103,9 +114,127 @@ impl WalEntry {
 /// A collection of log entries to be represented as an atomic batch.
 pub type WalBatch = Vec<WalEntry>;
 
+/// Manages the append-only Write-Ahead Log (Wal) file on disk.
+///
+/// Uses a length-prefixed stream framing ([length:u32][payload])
+/// for clean boundaries and facilitate crash recovery.
+pub struct WalManager {
+    file: File,
+    sync: bool,
+}
+
+impl WalManager {
+    /// Opens an existing wal file in append mode or creates a new one returning
+    /// `WalManager` with the fields initialized.
+    pub fn open<P: AsRef<Path>>(path: P, sync: bool) -> Result<Self, DbError> {
+        Ok(Self {
+            file: OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(path)?,
+            sync,
+        })
+    }
+
+    /// Explicitly syncs the file regardless of the `sync` flag being true or
+    /// false.
+    pub fn sync(&mut self) -> Result<(), DbError> {
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    /// Appends a batch of log entries to the Wal file using 4-byte little-endian
+    /// length indicator for each entry.
+    pub fn write_batch(&mut self, batch: &WalBatch) -> Result<(), DbError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        // Calculate the exact memory capacity required for this entire batch.
+        let net_size = batch.iter().map(|entry| 4 + entry.size()).sum();
+
+        let mut buffer = Vec::with_capacity(net_size);
+        for entry in batch {
+            let encoded_entry = entry.encode();
+            let entry_len = encoded_entry.len() as u32;
+
+            // prepend the size of this entry.
+            buffer.extend_from_slice(&entry_len.to_le_bytes());
+            buffer.extend_from_slice(&encoded_entry);
+        }
+        debug_assert_eq!(
+            buffer.len(),
+            net_size,
+            "final buffer len does not matches expected size"
+        );
+        self.file.write_all(&buffer)?;
+
+        if self.sync {
+            self.file.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Reads the entire Wal file, parsing length-prefixed entries into a batch.
+    /// Terminates cleanly when encountering EOF or 0 for length-prefix.
+    pub fn read_batch(&mut self) -> Result<WalBatch, DbError> {
+        let mut batch = WalBatch::new();
+
+        // Ensure we start reading from the very beginning of the log file.
+        self.file.seek(SeekFrom::Start(0))?;
+
+        let mut reader = BufReader::new(&self.file);
+        let mut len_buf = [0u8; 4];
+
+        use ErrorKind::*;
+        loop {
+            // Attempt to read length indicator of exactly 4 bytes.
+            match reader.read_exact(&mut len_buf) {
+                Err(err) if err.kind() == UnexpectedEof => {
+                    // Expected: we reached the end of log file.
+                    break;
+                }
+                Err(err) => return Err(DbError::Io(err)),
+                Ok(_) => {}
+            }
+            let entry_len = u32::from_le_bytes(len_buf) as usize;
+
+            // zero length prefix means end of valid log data.
+            if entry_len == 0 {
+                break;
+            }
+            let mut buffer = vec![0u8; entry_len];
+
+            // Read the exact payload bytes into buffer.
+            match reader.read_exact(&mut buffer) {
+                Err(err) if err.kind() == UnexpectedEof => {
+                    return Err(DbError::CorruptPage(format!(
+                        "invalid wal detected: header reported {} bytes, buf file ended unexpectedly",
+                        entry_len
+                    )));
+                }
+                Err(err) => return Err(DbError::Io(err)),
+                Ok(_) => {}
+            }
+            let entry = WalEntry::decode(&buffer)?;
+            batch.push(entry);
+        }
+        Ok(batch)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
     use super::*;
+
+    fn get_temp_wal_path(name: &str) -> PathBuf {
+        let mut path = PathBuf::from("/Volumes/External T7/");
+        path.push(format!("smol-db_test_wal_{}.log", name));
+        let _ = fs::remove_file(&path);
+        path
+    }
 
     #[test]
     fn test_wal_entry_symmetry_and_layout() {
@@ -144,5 +273,89 @@ mod tests {
             result.is_err(),
             "decoding a truncated header buffer must fail"
         );
+    }
+
+    #[test]
+    fn test_wal_manager_batch_persistence_and_framing() {
+        let path = get_temp_wal_path("persistence");
+
+        dbg!(&path);
+
+        let batch_out = vec![
+            WalEntry {
+                opcode: WalOp::Insert,
+                lsn: 1,
+                page_id: PageId(4096),
+                row_id: 100,
+                payload: vec![1, 2, 3],
+            },
+            WalEntry {
+                opcode: WalOp::Update,
+                lsn: 2,
+                page_id: PageId(8192),
+                row_id: 101,
+                payload: vec![4, 5, 6],
+            },
+            WalEntry {
+                opcode: WalOp::Delete,
+                lsn: 3,
+                page_id: PageId(4096),
+                row_id: 100,
+                payload: vec![],
+            },
+        ];
+        {
+            let mut wal = WalManager::open(&path, true).expect("failed to open Wal");
+            wal.write_batch(&batch_out)
+                .expect("failed to flush Wal batch");
+            wal.sync().expect("failed to close Wal");
+        }
+        {
+            let mut wal = WalManager::open(&path, true).expect("failed to reopen Wal");
+            let batch_in = wal
+                .read_batch()
+                .expect("failed to read Wal entries");
+            assert_eq!(batch_in.len(), 3, "should read exactly 3 framed entries");
+            assert_eq!(
+                batch_out, batch_in,
+                "decoded batch must match written batch exactly"
+            );
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    fn test_wal_manager_torn_write_detection() {
+        let path = get_temp_wal_path("torn_write");
+
+        // construct a corrupt file intentionally.
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+
+            // lie about the header length.
+            let wrong_len = 50u32;
+            file.write_all(&wrong_len.to_le_bytes()).unwrap();
+
+            // attempt to write a byte less.
+            file.write_all(&[0u8; 49]).unwrap();
+            file.sync_all().unwrap();
+        }
+        {
+            let mut wal = WalManager::open(&path, false).expect("failed to open wal");
+            let result = wal.read_batch();
+            assert!(
+                result.is_err(),
+                "reading a torn write should've triggered a corruption error"
+            );
+            if let Err(DbError::CorruptPage(msg)) = result {
+                assert!(msg.contains("invalid wal detected"));
+            } else {
+                panic!("expected DbError::CorruptPage, got a different error");
+            }
+        }
+        let _ = fs::remove_file(&path);
     }
 }
