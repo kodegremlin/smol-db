@@ -70,6 +70,10 @@ pub const LEAF_NODE_HEADER_SIZE: usize = 1 + // cell_type (u8)
 4 + // cell_count (u32)
 2; // free_size
 
+/// Maximum number of leaf cells a page can hold before requiring a split.
+pub const MAX_LEAF_NODE_CELLS: usize =
+    (PAGE_SIZE - LEAF_NODE_HEADER_SIZE) / (SLOT_ELEM_SIZE + RECORD_META_SIZE);
+
 #[repr(u8)]
 pub enum NodeType {
     Internal = 0,
@@ -184,6 +188,98 @@ impl BTreeNode {
         match self {
             Internal(node) => node.last_lsn,
             Leaf(node) => node.last_lsn,
+        }
+    }
+
+    /// Sets the provided lsn as `last_lsn` according to the node type.
+    pub fn set_last_lsn(&mut self, lsn: u64) {
+        use BTreeNode::*;
+        match self {
+            Internal(node) => node.last_lsn = lsn,
+            Leaf(node) => node.last_lsn = lsn,
+        }
+    }
+}
+
+impl BTreeNode {
+    /// Inserts the given key-value record into the page's `records` and updates
+    /// the sorted slotted leaf array to reflect the newly inserted position.
+    pub fn insert_record(&mut self, key: u32, payload: Vec<u8>) -> Result<(), DbError> {
+        if payload.len() > MAX_VALUE_SIZE {
+            return Err(DbError::TupleTooLarge(payload.len()));
+        }
+        match self {
+            BTreeNode::Leaf(node) => {
+                if node.slot_array.len() >= MAX_LEAF_NODE_CELLS {
+                    return Err(DbError::PageFull);
+                }
+                let insert_idx = match node
+                    .slot_array
+                    .binary_search_by_key(&key, |&idx| node.records[idx as usize].key)
+                {
+                    Ok(_) => return Err(DbError::DuplicateKey(key)),
+                    Err(idx) => idx,
+                };
+                let new_rec_idx = node.records.len() as u16;
+                node.records.push(Record {
+                    key,
+                    data: payload,
+                    is_deleted: false,
+                });
+                node.slot_array.insert(insert_idx, new_rec_idx);
+            }
+            BTreeNode::Internal(_) => {
+                return Err(DbError::CorruptPage(
+                    "attempted to insert record on an internal node".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Overwrites the raw byte payload of an existing record for the given key.
+    pub fn update_record(&mut self, key: u32, payload: Vec<u8>) -> Result<(), DbError> {
+        if payload.len() >= MAX_VALUE_SIZE {
+            return Err(DbError::TupleTooLarge(payload.len()));
+        }
+        match self {
+            BTreeNode::Leaf(node) => {
+                let update_idx = node
+                    .slot_array
+                    .binary_search_by_key(&key, |&rec_idx| node.records[rec_idx as usize].key)
+                    .map_err(|_| DbError::KeyNotFound(key))?;
+
+                let rec_idx = node.slot_array[update_idx] as usize;
+                node.records[rec_idx].data = payload;
+                Ok(())
+            }
+            BTreeNode::Internal(_) => {
+                return Err(DbError::CorruptPage(
+                    "attempted to update record on an internal node".into(),
+                ));
+            }
+        }
+    }
+
+    /// Marks an existing cell as logically deleted without compacting the physical
+    /// bytes immediately.
+    pub fn delete_record(&mut self, key: u32) -> Result<(), DbError> {
+        match self {
+            BTreeNode::Leaf(node) => {
+                let delete_idx = node
+                    .slot_array
+                    .binary_search_by_key(&key, |&rec_idx| node.records[rec_idx as usize].key)
+                    .map_err(|_| DbError::KeyNotFound(key))?;
+
+                let rec_idx = node.slot_array[delete_idx] as usize;
+                node.records[rec_idx].is_deleted = true;
+                Ok(())
+            }
+            BTreeNode::Internal(_) => {
+                return Err(DbError::CorruptPage(
+                    "attempted to delete record on an internal node".into(),
+                ));
+            }
         }
     }
 }
