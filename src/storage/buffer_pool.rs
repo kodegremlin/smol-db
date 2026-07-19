@@ -94,9 +94,12 @@ impl BufferPool {
         if let Some(frame) = self.page_table.get(&page_id) {
             let mut node_guard = frame
                 .write()
-                .map_err(|_| DbError::CorruptPage("Poisoned lock".into()))?;
+                .map_err(|_| DbError::CorruptPage("poisoned lock".into()))?;
 
             if node_guard.is_dirty() {
+                if let Some(flusher) = &self.wal_flusher {
+                    flusher.flush_upto(node_guard.get_last_lsn())?;
+                }
                 let mut raw_page = Page::new();
                 node_guard.encode(&mut raw_page)?;
                 self.disk_manager.write_page(page_id, &raw_page)?;
