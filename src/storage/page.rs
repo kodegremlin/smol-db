@@ -253,11 +253,9 @@ impl BTreeNode {
                 node.records[rec_idx].data = payload;
                 Ok(())
             }
-            BTreeNode::Internal(_) => {
-                return Err(DbError::CorruptPage(
-                    "attempted to update record on an internal node".into(),
-                ));
-            }
+            BTreeNode::Internal(_) => Err(DbError::CorruptPage(
+                "attempted to update record on an internal node".into(),
+            )),
         }
     }
 
@@ -275,11 +273,9 @@ impl BTreeNode {
                 node.records[rec_idx].is_deleted = true;
                 Ok(())
             }
-            BTreeNode::Internal(_) => {
-                return Err(DbError::CorruptPage(
-                    "attempted to delete record on an internal node".into(),
-                ));
-            }
+            BTreeNode::Internal(_) => Err(DbError::CorruptPage(
+                "attempted to delete record on an internal node".into(),
+            )),
         }
     }
 }
