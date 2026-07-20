@@ -546,10 +546,7 @@ pub struct DiskManager {
 }
 
 impl DiskManager {
-    pub fn new<P>(path: P) -> Result<Self, DbError>
-    where
-        P: AsRef<Path>,
-    {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, DbError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -834,7 +831,7 @@ mod tests {
     #[test]
     fn test_disk_manager_page_lifecycle() -> Result<(), Box<dyn Error>> {
         let path = temp_db_path("disk_manager_lifecycle");
-        let mut dm = DiskManager::new(&path)?;
+        let mut dm = DiskManager::open(&path)?;
 
         // Allocate two physical pages
         let page_id_1 = dm.allocate_page();
@@ -877,14 +874,14 @@ mod tests {
     fn test_disk_manager_header_persistence() -> Result<(), Box<dyn Error>> {
         let path = temp_db_path("header_persistence");
         {
-            let mut dm = DiskManager::new(&path)?;
+            let mut dm = DiskManager::open(&path)?;
             dm.header.last_row_id = 42;
             dm.header.page_root_offset = 8192;
             dm.header.next_lsn = 1000;
             dm.header.next_free_offset = 16384;
             dm.save_header()?;
         }
-        let dm_reopened = DiskManager::new(&path)?;
+        let dm_reopened = DiskManager::open(&path)?;
         assert_eq!(dm_reopened.header.last_row_id, 42);
         assert_eq!(dm_reopened.header.page_root_offset, 8192);
         assert_eq!(dm_reopened.header.next_lsn, 1000);

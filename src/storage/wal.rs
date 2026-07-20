@@ -134,6 +134,7 @@ pub type WalBatch = Vec<WalEntry>;
 ///
 /// Uses a length-prefixed stream framing ([length:u32][payload])
 /// for clean boundaries and facilitate crash recovery.
+#[derive(Debug)]
 pub struct WalManager {
     file: File,
     sync: bool,
