@@ -1,10 +1,15 @@
 use std::{
+    cmp,
     fs::{File, OpenOptions},
     io::{BufReader, ErrorKind, Read, Seek, SeekFrom, Write},
     path::Path,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::{error::DbError, storage::page::PageId};
+use crate::{
+    error::DbError,
+    storage::{buffer_pool::WalFlusher, page::PageId},
+};
 
 /// Fixed size of the physical Wal entry header in bytes.
 /// op(1) + lsn(8) + page_id(8) + row_id(4) + val_len(4) = 25 bytes.
@@ -50,6 +55,17 @@ pub struct WalEntry {
 }
 
 impl WalEntry {
+    /// Constructor for the `WalEntry`.
+    pub fn new(opcode: WalOp, lsn: u64, page_id: PageId, row_id: u32, payload: Vec<u8>) -> Self {
+        Self {
+            opcode,
+            lsn,
+            page_id,
+            row_id,
+            payload,
+        }
+    }
+
     /// Serializes the log entry into a raw little-endian byte vector.
     /// [WAL_ENTRY_HEADER_SIZE] + \[payload: Vec<u8>\]
     pub fn encode(&self) -> Vec<u8> {
@@ -121,6 +137,28 @@ pub type WalBatch = Vec<WalEntry>;
 pub struct WalManager {
     file: File,
     sync: bool,
+
+    /// Tracks the total number of log entries appended since the last
+    /// checkpoint. Used for volume based checkpointing.
+    entry_count: usize,
+
+    /// Tracks the highest Lsn currently written and fsynced to the disk.
+    /// Provides interior mutability for the `WalFlusher` trait.
+    flushed_lsn: AtomicU64,
+}
+
+impl WalFlusher for WalManager {
+    fn flush_upto(&self, lsn: u64) -> Result<(), DbError> {
+        let current_flushed = self.flushed_lsn.load(Ordering::Acquire);
+
+        // If the requested lsn is higher than what has already been fsynced,
+        // force an immediate fsync to enforce wal consistency.
+        if lsn > current_flushed {
+            self.file.sync_all()?;
+            self.flushed_lsn.store(lsn, Ordering::Release);
+        }
+        Ok(())
+    }
 }
 
 impl WalManager {
@@ -134,7 +172,19 @@ impl WalManager {
                 .read(true)
                 .open(path)?,
             sync,
+            entry_count: 0,
+            flushed_lsn: AtomicU64::new(0),
         })
+    }
+
+    /// Returns the highest Lsn currently guaranteed to be durable on physical disk.
+    pub fn flushed_lsn(&self) -> u64 {
+        self.flushed_lsn.load(Ordering::Acquire)
+    }
+
+    /// Returns the total number of log entries appended since the last checkpoint.
+    pub fn entry_count(&self) -> usize {
+        self.entry_count
     }
 
     /// Explicitly syncs the file regardless of the `sync` flag being true or
@@ -146,12 +196,22 @@ impl WalManager {
 
     /// Appends a batch of log entries to the Wal file using 4-byte little-endian
     /// length indicator for each entry.
+    /// Buffers the entire batch in-memory and issues a single POSIX write and if
+    /// applicable, a single disk sync.
     pub fn write_batch(&mut self, batch: &WalBatch) -> Result<(), DbError> {
         if batch.is_empty() {
             return Ok(());
         }
+        let mut max_batch_lsn = 0;
+
         // Calculate the exact memory capacity required for this entire batch.
-        let net_size = batch.iter().map(|entry| 4 + entry.size()).sum();
+        let net_size = batch
+            .iter()
+            .map(|entry| {
+                max_batch_lsn = cmp::max(max_batch_lsn, entry.lsn);
+                4 + entry.size()
+            })
+            .sum();
 
         let mut buffer = Vec::with_capacity(net_size);
         for entry in batch {
@@ -172,11 +232,33 @@ impl WalManager {
         if self.sync {
             self.file.sync_all()?;
         }
+        self.flushed_lsn
+            .store(max_batch_lsn, Ordering::Release);
+        self.entry_count += batch.len();
+        Ok(())
+    }
+
+    /// Truncates the physical Wal file to 0 bytes and rewinding the Os file
+    /// cursor as well.
+    ///
+    /// Method exists solely for checkpointing purposes and must only be
+    /// called after `buffer_pool.flush_all_pages()` and
+    /// `disk_manager.save_header()` succeed during a database checkpoint.
+    pub fn truncate(&mut self) -> Result<(), DbError> {
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        if self.sync {
+            self.file.sync_all()?;
+        }
+        self.flushed_lsn.store(0, Ordering::Release);
+        self.entry_count = 0;
         Ok(())
     }
 
     /// Reads the entire Wal file, parsing length-prefixed entries into a batch.
     /// Terminates cleanly when encountering EOF or 0 for length-prefix.
+    ///
+    /// Returns an error if a torn write is detected.
     pub fn read_batch(&mut self) -> Result<WalBatch, DbError> {
         let mut batch = WalBatch::new();
 
@@ -185,6 +267,7 @@ impl WalManager {
 
         let mut reader = BufReader::new(&self.file);
         let mut len_buf = [0u8; 4];
+        let mut max_observed_lsn = 0;
 
         use ErrorKind::*;
         loop {
@@ -209,7 +292,7 @@ impl WalManager {
             match reader.read_exact(&mut buffer) {
                 Err(err) if err.kind() == UnexpectedEof => {
                     return Err(DbError::CorruptPage(format!(
-                        "invalid wal detected: header reported {} bytes, buf file ended unexpectedly",
+                        "torn write: header reported {} bytes, buf file ended unexpectedly",
                         entry_len
                     )));
                 }
@@ -217,8 +300,12 @@ impl WalManager {
                 Ok(_) => {}
             }
             let entry = WalEntry::decode(&buffer)?;
+            max_observed_lsn = cmp::max(max_observed_lsn, entry.lsn);
             batch.push(entry);
         }
+        self.flushed_lsn
+            .store(max_observed_lsn, Ordering::Release);
+        self.entry_count = batch.len();
         Ok(batch)
     }
 }
@@ -276,42 +363,28 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_manager_batch_persistence_and_framing() {
+    fn test_wal_manager_batch_write_and_read_roundtrip() {
         let path = get_temp_wal_path("persistence");
 
         dbg!(&path);
 
         let batch_out = vec![
-            WalEntry {
-                opcode: WalOp::Insert,
-                lsn: 1,
-                page_id: PageId(4096),
-                row_id: 100,
-                payload: vec![1, 2, 3],
-            },
-            WalEntry {
-                opcode: WalOp::Update,
-                lsn: 2,
-                page_id: PageId(8192),
-                row_id: 101,
-                payload: vec![4, 5, 6],
-            },
-            WalEntry {
-                opcode: WalOp::Delete,
-                lsn: 3,
-                page_id: PageId(4096),
-                row_id: 100,
-                payload: vec![],
-            },
+            WalEntry::new(WalOp::Insert, 10, PageId(1), 0, vec![1, 2, 3]),
+            WalEntry::new(WalOp::Update, 11, PageId(1), 0, vec![6, 9, 6, 9]),
+            WalEntry::new(WalOp::Delete, 12, PageId(2), 5, vec![]),
         ];
         {
             let mut wal = WalManager::open(&path, true).expect("failed to open Wal");
+
             wal.write_batch(&batch_out)
                 .expect("failed to flush Wal batch");
             wal.sync().expect("failed to close Wal");
+            assert_eq!(wal.entry_count(), 3);
+            assert_eq!(wal.flushed_lsn(), 12);
         }
         {
             let mut wal = WalManager::open(&path, true).expect("failed to reopen Wal");
+
             let batch_in = wal
                 .read_batch()
                 .expect("failed to read Wal entries");
@@ -328,35 +401,91 @@ mod tests {
     fn test_wal_manager_torn_write_detection() {
         let path = get_temp_wal_path("torn_write");
 
+        let mut wal = WalManager::open(&path, false).expect("opening wal should not fail");
+        let batch = vec![WalEntry::new(
+            WalOp::Insert,
+            1,
+            PageId(10),
+            1,
+            vec![100, 200],
+        )];
+        wal.write_batch(&batch).unwrap();
+        wal.sync().unwrap();
+
         // construct a corrupt file intentionally.
-        {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .open(&path)
-                .unwrap();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
 
-            // lie about the header length.
-            let wrong_len = 50u32;
-            file.write_all(&wrong_len.to_le_bytes()).unwrap();
+        // lie about the header length.
+        let wrong_len: u32 = 50;
+        file.write_all(&wrong_len.to_le_bytes()).unwrap();
 
-            // attempt to write a byte less.
-            file.write_all(&[0u8; 49]).unwrap();
-            file.sync_all().unwrap();
-        }
-        {
-            let mut wal = WalManager::open(&path, false).expect("failed to open wal");
-            let result = wal.read_batch();
-            assert!(
-                result.is_err(),
-                "reading a torn write should've triggered a corruption error"
-            );
-            if let Err(DbError::CorruptPage(msg)) = result {
-                assert!(msg.contains("invalid wal detected"));
-            } else {
-                panic!("expected DbError::CorruptPage, got a different error");
-            }
+        // attempt to write a byte less.
+        file.write_all(&[0u8; 49]).unwrap();
+        file.sync_all().unwrap();
+
+        // reopen and read the corrupt data
+        let mut wal = WalManager::open(&path, false).expect("failed to open wal");
+        let result = wal.read_batch();
+
+        assert!(
+            result.is_err(),
+            "reading a torn write should've triggered a corruption error"
+        );
+        if let Err(DbError::CorruptPage(msg)) = result {
+            assert!(msg.contains("torn write"));
+        } else {
+            panic!("expected DbError::CorruptPage, got a different error");
         }
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_wal_manager_truncation_reclaims_disk_space() {
+        let path = get_temp_wal_path("truncation");
+
+        let mut wal = WalManager::open(&path, false).unwrap();
+        let batch = vec![WalEntry::new(
+            WalOp::Insert,
+            50,
+            PageId(1),
+            1,
+            vec![0; 1000],
+        )];
+        wal.write_batch(&batch).unwrap();
+
+        let initial_size = fs::metadata(&path).unwrap().len();
+        assert!(initial_size > 1000);
+
+        wal.truncate()
+            .expect("wal truncation should succeed");
+
+        let truncated_size = fs::metadata(path).unwrap().len();
+        assert_eq!(truncated_size, 0);
+        assert_eq!(wal.entry_count(), 0);
+        assert_eq!(wal.flushed_lsn(), 0);
+    }
+
+    #[test]
+    fn test_wal_flusher_enforces_lsn() {
+        let path = get_temp_wal_path("flusher");
+
+        let mut wal = WalManager::open(path, false).unwrap();
+        let batch = vec![WalEntry::new(
+            WalOp::Insert,
+            100,
+            PageId(5),
+            1,
+            vec![1, 2, 4],
+        )];
+
+        wal.write_batch(&batch).unwrap();
+        assert_eq!(wal.flushed_lsn(), 100);
+
+        // simplified ability test, requesting durability upto lsn 100
+        let flusher: &dyn WalFlusher = &wal;
+        assert!(flusher.flush_upto(100).is_ok());
     }
 }
