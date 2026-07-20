@@ -312,7 +312,10 @@ impl WalManager {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs::{self, remove_file},
+        path::PathBuf,
+    };
 
     use super::*;
 
@@ -462,17 +465,19 @@ mod tests {
         wal.truncate()
             .expect("wal truncation should succeed");
 
-        let truncated_size = fs::metadata(path).unwrap().len();
+        let truncated_size = fs::metadata(&path).unwrap().len();
         assert_eq!(truncated_size, 0);
         assert_eq!(wal.entry_count(), 0);
         assert_eq!(wal.flushed_lsn(), 0);
+
+        let _ = remove_file(path);
     }
 
     #[test]
     fn test_wal_flusher_enforces_lsn() {
         let path = get_temp_wal_path("flusher");
 
-        let mut wal = WalManager::open(path, false).unwrap();
+        let mut wal = WalManager::open(&path, false).unwrap();
         let batch = vec![WalEntry::new(
             WalOp::Insert,
             100,
@@ -487,5 +492,6 @@ mod tests {
         // simplified ability test, requesting durability upto lsn 100
         let flusher: &dyn WalFlusher = &wal;
         assert!(flusher.flush_upto(100).is_ok());
+        let _ = remove_file(path);
     }
 }
