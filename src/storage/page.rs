@@ -24,16 +24,20 @@ pub struct Page {
 }
 
 impl Page {
+    /// Allocates a 4KB block onto the heap using `Box` and returns the pointer
+    /// to it as `Page`.
     pub fn new() -> Self {
         Self {
             data: Box::new([0; PAGE_SIZE]),
         }
     }
 
+    /// Access `Page` as immutable byte slice.
     pub fn as_bytes(&self) -> &[u8; PAGE_SIZE] {
         &self.data
     }
 
+    /// Access `Page` as mutable byte slice.
     pub fn as_bytes_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
         &mut self.data
     }
