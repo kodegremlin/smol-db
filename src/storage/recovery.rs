@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn test_aries_redo_idempotency_skips_flushed_pages() {
-        let (mut pool, page_id, _) = setup_test_pool("");
+        let (mut pool, page_id, path) = setup_test_pool("");
         {
             let frame = pool.fetch_page(page_id).unwrap();
             let mut node = frame.write().unwrap();
@@ -152,11 +152,12 @@ mod tests {
             }
             _ => panic!("expected leaf node"),
         }
+        let _ = fs::remove_file(path);
     }
 
     #[test]
     fn test_init_storage_recovers_and_truncates_log() {
-        let (mut pool, page_id, _) = setup_test_pool("");
+        let (mut pool, page_id, db_path) = setup_test_pool("");
         let path = PathBuf::from("/Volumes/External T7/test.wal");
 
         // Write a persistent log batch to disk via WalManager
@@ -187,5 +188,7 @@ mod tests {
             post_recovery_wal_size, 0,
             "WAL file was not truncated after checkpoint!"
         );
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(db_path);
     }
 }

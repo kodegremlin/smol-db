@@ -548,10 +548,10 @@ pub struct DiskManager {
 impl DiskManager {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, DbError> {
         let file = OpenOptions::new()
-            .read(true)
-            .write(true)
             .create(true)
             .truncate(false)
+            .read(true)
+            .write(true)
             .open(path)?;
 
         let mut header = FileHeader::default();
