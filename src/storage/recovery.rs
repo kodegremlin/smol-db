@@ -139,8 +139,8 @@ mod tests {
         {
             let frame = pool.fetch_page(page_id).unwrap();
             let mut node_guard = frame.write();
-            match &mut *node_guard {
-                BTreeNode::Leaf(node) => node.insert_record(1, vec![10, 20]).unwrap(),
+            match *node_guard {
+                BTreeNode::Leaf(ref mut node) => node.insert_record(1, vec![10, 20]).unwrap(),
                 BTreeNode::Internal(_) => {}
             }
             node_guard.mark_dirty(100);

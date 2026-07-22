@@ -17,6 +17,12 @@ pub const PAGE_SIZE: usize = 4096;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageId(pub u64);
 
+impl From<PageId> for u64 {
+    fn from(value: PageId) -> Self {
+        value.0
+    }
+}
+
 /// An owned, 4KB buffer representing a physical slotted page.
 #[derive(Debug)]
 pub struct Page {
@@ -101,7 +107,7 @@ pub struct Record {
 pub struct InternalNode {
     pub page_id: PageId,
     pub last_lsn: u64,
-    pub rightmost_child_id: u64,
+    pub rightmost_child_id: PageId,
     pub slot_array: Vec<u16>,
     pub entries: Vec<IndexEntry>,
     pub free_size: u16,
@@ -125,7 +131,7 @@ impl InternalNode {
         // If partition_idx == len(), target_key is >= all routing keys in
         // this node. Route to the rightmost child pointer
         if partition_idx == self.slot_array.len() {
-            Ok(PageId(self.rightmost_child_id))
+            Ok(self.rightmost_child_id)
         } else {
             let page_id = self.entries[self.slot_array[partition_idx] as usize].child_page_id;
             Ok(PageId(page_id))
@@ -464,7 +470,7 @@ impl BTreeNode {
                 Ok(BTreeNode::Internal(InternalNode {
                     page_id: PageId(file_index),
                     last_lsn,
-                    rightmost_child_id: right_index,
+                    rightmost_child_id: PageId(right_index),
                     slot_array: indices,
                     entries,
                     free_size,
@@ -529,7 +535,7 @@ impl BTreeNode {
                 cursor.write_u8(NodeType::Internal as u8);
                 cursor.write_u64(node.page_id.0);
                 cursor.write_u64(node.last_lsn);
-                cursor.write_u64(node.rightmost_child_id);
+                cursor.write_u64(node.rightmost_child_id.into());
 
                 cursor.write_u32(node.slot_array.len() as u32);
                 for &offset in &node.slot_array {
@@ -821,7 +827,7 @@ mod tests {
         let internal = InternalNode {
             page_id: PageId(1),
             last_lsn: 555,
-            rightmost_child_id: 5,
+            rightmost_child_id: PageId(5),
             slot_array: vec![0, 1, 2],
             entries: entries.clone(),
             free_size: 0,
@@ -834,7 +840,7 @@ mod tests {
         if let BTreeNode::Internal(dec_internal) = decoded {
             assert_eq!(dec_internal.page_id, PageId(1));
             assert_eq!(dec_internal.last_lsn, 555);
-            assert_eq!(dec_internal.rightmost_child_id, 5);
+            assert_eq!(dec_internal.rightmost_child_id, PageId(5));
             assert_eq!(dec_internal.slot_array.len(), 3);
             assert_eq!(dec_internal.entries[1].key, 200);
             assert_eq!(dec_internal.entries[1].child_page_id, 3);
