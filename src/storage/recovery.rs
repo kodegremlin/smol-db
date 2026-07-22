@@ -74,9 +74,24 @@ impl RecoveryEngine {
         design around complicated lifetimes and right now we'll keep it
         simple and in future when we add transaction and shit, we'll see.*/
         match entry.opcode {
-            WalOp::Insert => node.insert_record(entry.row_id, entry.payload.clone()),
-            WalOp::Update => node.update_record(entry.row_id, entry.payload.clone()),
-            WalOp::Delete => node.delete_record(entry.row_id),
+            WalOp::Insert => match node {
+                BTreeNode::Leaf(node) => node.insert_record(entry.row_id, entry.payload.clone()),
+                BTreeNode::Internal(_) => Err(DbError::CorruptPage(
+                    "attempted to insert a record into internal node".into(),
+                )),
+            },
+            WalOp::Update => match node {
+                BTreeNode::Leaf(node) => node.update_record(entry.row_id, entry.payload.clone()),
+                BTreeNode::Internal(_) => Err(DbError::CorruptPage(
+                    "attempted to insert a record into internal node".into(),
+                )),
+            },
+            WalOp::Delete => match node {
+                BTreeNode::Leaf(node) => node.delete_record(entry.row_id),
+                BTreeNode::Internal(_) => Err(DbError::CorruptPage(
+                    "attempted to insert a record into internal node".into(),
+                )),
+            },
         }
     }
 }
@@ -123,9 +138,12 @@ mod tests {
         let (mut pool, page_id, path) = setup_test_pool("1");
         {
             let frame = pool.fetch_page(page_id).unwrap();
-            let mut node = frame.write();
-            node.insert_record(1, vec![10, 20]).unwrap();
-            node.mark_dirty(100);
+            let mut node_guard = frame.write();
+            match &mut *node_guard {
+                BTreeNode::Leaf(node) => node.insert_record(1, vec![10, 20]).unwrap(),
+                BTreeNode::Internal(_) => {}
+            }
+            node_guard.mark_dirty(100);
         }
         pool.flush_all_pages().unwrap();
 

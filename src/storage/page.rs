@@ -111,6 +111,28 @@ pub struct InternalNode {
     pub is_dirty: bool,
 }
 
+impl InternalNode {
+    /// Evaluates internal routing brackets using O(log N) binary search to determine
+    /// the PageId of the child node containing `target_key`.
+    pub fn route_key(&self, target_key: u64) -> Result<PageId, DbError> {
+        let partition_idx = self.slot_array.partition_point(|&slot_idx| {
+            // Find the first index where entry.key > target_key as that is
+            // the internal node-point pointing to the leaf where the
+            // key-val exists
+            let entry_key = self.entries[slot_idx as usize].key;
+            entry_key <= target_key
+        });
+        // If partition_idx == len(), target_key is >= all routing keys in
+        // this node. Route to the rightmost child pointer
+        if partition_idx == self.slot_array.len() {
+            Ok(PageId(self.rightmost_child_id))
+        } else {
+            let page_id = self.entries[self.slot_array[partition_idx] as usize].child_page_id;
+            Ok(PageId(page_id))
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct LeafNode {
     pub page_id: PageId,
@@ -127,6 +149,88 @@ pub struct LeafNode {
     /// decoding.
     pub is_dirty: bool,
 }
+
+impl LeafNode {
+    /// Inserts the given key-value record into the page's `records` and updates
+    /// the sorted slotted leaf array to reflect the newly inserted position.
+    pub fn insert_record(&mut self, key: u64, payload: Vec<u8>) -> Result<(), DbError> {
+        if payload.len() > MAX_VALUE_SIZE {
+            return Err(DbError::TupleTooLarge(payload.len()));
+        }
+        if self.slot_array.len() >= MAX_LEAF_NODE_CELLS {
+            return Err(DbError::PageFull);
+        }
+        let insert_idx = match self
+            .slot_array
+            .binary_search_by_key(&key, |&idx| self.records[idx as usize].key)
+        {
+            Ok(_) => return Err(DbError::DuplicateKey(key)),
+            Err(idx) => idx,
+        };
+        let new_rec_idx = self.records.len() as u16;
+        self.records.push(Record {
+            key,
+            data: payload,
+            is_deleted: false,
+        });
+        self.slot_array.insert(insert_idx, new_rec_idx);
+        Ok(())
+    }
+
+    /// Overwrites the raw byte payload of an existing record for the given key.
+    pub fn update_record(&mut self, key: u64, payload: Vec<u8>) -> Result<(), DbError> {
+        if payload.len() >= MAX_VALUE_SIZE {
+            return Err(DbError::TupleTooLarge(payload.len()));
+        }
+        let update_idx = self
+            .slot_array
+            .binary_search_by_key(&key, |&rec_idx| self.records[rec_idx as usize].key)
+            .map_err(|_| DbError::KeyNotFound(key))?;
+
+        let rec_idx = self.slot_array[update_idx] as usize;
+        self.records[rec_idx].data = payload;
+        Ok(())
+    }
+
+    /// Marks an existing cell as logically deleted without compacting the physical
+    /// bytes immediately.
+    pub fn delete_record(&mut self, key: u64) -> Result<(), DbError> {
+        let delete_idx = self
+            .slot_array
+            .binary_search_by_key(&key, |&rec_idx| self.records[rec_idx as usize].key)
+            .map_err(|_| DbError::KeyNotFound(key))?;
+
+        let rec_idx = self.slot_array[delete_idx] as usize;
+        self.records[rec_idx].is_deleted = true;
+        Ok(())
+    }
+
+    /// Performs a binary search on the leaf over the slotted array to find record
+    /// by key.
+    ///
+    /// Returns None if the key does not exist or has been logically deleted or
+    /// actually deleted after I've added compaction (that's going to be so cool).
+    pub fn get_record(&self, target_key: u64) -> Option<Vec<u8>> {
+        let slot_idx = self
+            .slot_array
+            .binary_search_by_key(&target_key, |&rec_idx| self.records[rec_idx as usize].key)
+            .ok()?;
+
+        let rec_idx = self.slot_array[slot_idx] as usize;
+        if let record = &self.records[rec_idx]
+            && !record.is_deleted
+        {
+            Some(record.data.clone())
+        } else {
+            None
+        }
+    }
+}
+
+/* FIXME: maybe I can implement `Deref` or `AsRef` or `Borrow` on `BTreeNode`
+for it to automatically convert to one of the types, whichever one is more
+idiomatic for what I am trying to do. Then we won't have to match on node every
+time we want to do something.*/
 
 #[derive(Debug, Clone)]
 pub enum BTreeNode {
@@ -201,113 +305,6 @@ impl BTreeNode {
         match self {
             Internal(node) => node.last_lsn = lsn,
             Leaf(node) => node.last_lsn = lsn,
-        }
-    }
-}
-
-impl BTreeNode {
-    /// Evaluates internal routing brackets using O(log N) binary search to determine
-    /// the PageId of the child node containing `target_key`.
-    pub fn route_key(&self, target_key: u64) -> Result<PageId, DbError> {
-        match self {
-            BTreeNode::Internal(node) => {
-                let partition_idx = node.slot_array.partition_point(|&slot_idx| {
-                    // Find the first index where entry.key > target_key as that is
-                    // the internal node-point pointing to the leaf where the
-                    // key-val exists
-                    let entry_key = node.entries[slot_idx as usize].key;
-                    entry_key <= target_key
-                });
-                // If partition_idx == len(), target_key is >= all routing keys in
-                // this node. Route to the rightmost child pointer
-                if partition_idx == node.slot_array.len() {
-                    Ok(PageId(node.rightmost_child_id))
-                } else {
-                    let page_id =
-                        node.entries[node.slot_array[partition_idx] as usize].child_page_id;
-                    Ok(PageId(page_id))
-                }
-            }
-            BTreeNode::Leaf(_) => Err(DbError::CorruptPage(
-                "key search not allowed on a leaf node for this operation".into(),
-            )),
-        }
-    }
-
-    /// Inserts the given key-value record into the page's `records` and updates
-    /// the sorted slotted leaf array to reflect the newly inserted position.
-    pub fn insert_record(&mut self, key: u64, payload: Vec<u8>) -> Result<(), DbError> {
-        if payload.len() > MAX_VALUE_SIZE {
-            return Err(DbError::TupleTooLarge(payload.len()));
-        }
-        match self {
-            BTreeNode::Leaf(node) => {
-                if node.slot_array.len() >= MAX_LEAF_NODE_CELLS {
-                    return Err(DbError::PageFull);
-                }
-                let insert_idx = match node
-                    .slot_array
-                    .binary_search_by_key(&key, |&idx| node.records[idx as usize].key)
-                {
-                    Ok(_) => return Err(DbError::DuplicateKey(key)),
-                    Err(idx) => idx,
-                };
-                let new_rec_idx = node.records.len() as u16;
-                node.records.push(Record {
-                    key,
-                    data: payload,
-                    is_deleted: false,
-                });
-                node.slot_array.insert(insert_idx, new_rec_idx);
-            }
-            BTreeNode::Internal(_) => {
-                return Err(DbError::CorruptPage(
-                    "attempted to insert record on an internal node".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Overwrites the raw byte payload of an existing record for the given key.
-    pub fn update_record(&mut self, key: u64, payload: Vec<u8>) -> Result<(), DbError> {
-        if payload.len() >= MAX_VALUE_SIZE {
-            return Err(DbError::TupleTooLarge(payload.len()));
-        }
-        match self {
-            BTreeNode::Leaf(node) => {
-                let update_idx = node
-                    .slot_array
-                    .binary_search_by_key(&key, |&rec_idx| node.records[rec_idx as usize].key)
-                    .map_err(|_| DbError::KeyNotFound(key))?;
-
-                let rec_idx = node.slot_array[update_idx] as usize;
-                node.records[rec_idx].data = payload;
-                Ok(())
-            }
-            BTreeNode::Internal(_) => Err(DbError::CorruptPage(
-                "attempted to update record on an internal node".into(),
-            )),
-        }
-    }
-
-    /// Marks an existing cell as logically deleted without compacting the physical
-    /// bytes immediately.
-    pub fn delete_record(&mut self, key: u64) -> Result<(), DbError> {
-        match self {
-            BTreeNode::Leaf(node) => {
-                let delete_idx = node
-                    .slot_array
-                    .binary_search_by_key(&key, |&rec_idx| node.records[rec_idx as usize].key)
-                    .map_err(|_| DbError::KeyNotFound(key))?;
-
-                let rec_idx = node.slot_array[delete_idx] as usize;
-                node.records[rec_idx].is_deleted = true;
-                Ok(())
-            }
-            BTreeNode::Internal(_) => Err(DbError::CorruptPage(
-                "attempted to delete record on an internal node".into(),
-            )),
         }
     }
 }
