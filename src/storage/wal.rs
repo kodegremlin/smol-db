@@ -13,7 +13,7 @@ use crate::{
 
 /// Fixed size of the physical Wal entry header in bytes.
 /// op(1) + lsn(8) + page_id(8) + row_id(4) + val_len(4) = 25 bytes.
-pub const WAL_ENTRY_HEADER_SIZE: usize = 25;
+pub const WAL_ENTRY_HEADER_SIZE: usize = 29;
 
 /// Represents the physical operation recorded in the log.
 #[repr(u8)]
@@ -50,13 +50,13 @@ pub struct WalEntry {
     pub opcode: WalOp,
     pub lsn: u64,
     pub page_id: PageId,
-    pub row_id: u32,
+    pub row_id: u64,
     pub payload: Vec<u8>,
 }
 
 impl WalEntry {
     /// Constructor for the `WalEntry`.
-    pub fn new(opcode: WalOp, lsn: u64, page_id: PageId, row_id: u32, payload: Vec<u8>) -> Self {
+    pub fn new(opcode: WalOp, lsn: u64, page_id: PageId, row_id: u64, payload: Vec<u8>) -> Self {
         Self {
             opcode,
             lsn,
@@ -104,8 +104,8 @@ impl WalEntry {
         let opcode = WalOp::from_u8(buffer[0])?;
         let lsn = u64::from_le_bytes(buffer[1..9].try_into().unwrap());
         let page_id = PageId(u64::from_le_bytes(buffer[9..17].try_into().unwrap()));
-        let row_id = u32::from_le_bytes(buffer[17..21].try_into().unwrap());
-        let payload_len = u32::from_le_bytes(buffer[21..25].try_into().unwrap()) as usize;
+        let row_id = u64::from_le_bytes(buffer[17..25].try_into().unwrap());
+        let payload_len = u32::from_le_bytes(buffer[25..29].try_into().unwrap()) as usize;
 
         // Verify net buffer size against calculated payload size.
         let expected_size = WAL_ENTRY_HEADER_SIZE + payload_len;
@@ -116,7 +116,7 @@ impl WalEntry {
                 buffer.len()
             )));
         }
-        let payload = buffer[25..expected_size].to_vec();
+        let payload = buffer[29..expected_size].to_vec();
         Ok(Self {
             opcode,
             lsn,
@@ -339,10 +339,10 @@ mod tests {
 
         let encoded = original_entry.encode();
 
-        // Verify exact byte sizing: 25 header bytes + 4 payload bytes = 29 bytes
+        // Verify exact byte sizing: 29 header bytes + 4 payload bytes = 33 bytes
         assert_eq!(
             encoded.len(),
-            29,
+            33,
             "encoded buffer size must match header + payload length"
         );
 

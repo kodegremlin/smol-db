@@ -52,9 +52,7 @@ impl RecoveryEngine {
             {
                 // Acquire RAII write guard over the page buffer.
                 let frame = buf_pool.fetch_page(entry.page_id)?;
-                let mut node = frame
-                    .write()
-                    .map_err(|_| DbError::CorruptPage("poisoned lock".into()))?;
+                let mut node = frame.write();
 
                 // If the physical page on disk already bears an Lsn >= log's
                 // lsn this update was already written to disk.
@@ -122,10 +120,10 @@ mod tests {
 
     #[test]
     fn test_aries_redo_idempotency_skips_flushed_pages() {
-        let (mut pool, page_id, path) = setup_test_pool("");
+        let (mut pool, page_id, path) = setup_test_pool("1");
         {
             let frame = pool.fetch_page(page_id).unwrap();
-            let mut node = frame.write().unwrap();
+            let mut node = frame.write();
             node.insert_record(1, vec![10, 20]).unwrap();
             node.mark_dirty(100);
         }
@@ -140,7 +138,7 @@ mod tests {
         assert_eq!(max_lsn, 150);
 
         let frame = pool.fetch_page(page_id).unwrap();
-        let node = frame.write().unwrap();
+        let node = frame.write();
         assert_eq!(node.get_last_lsn(), 150);
         dbg!(&node);
 
@@ -157,7 +155,7 @@ mod tests {
 
     #[test]
     fn test_init_storage_recovers_and_truncates_log() {
-        let (mut pool, page_id, db_path) = setup_test_pool("");
+        let (mut pool, page_id, db_path) = setup_test_pool("2");
         let path = PathBuf::from("/Volumes/External T7/test.wal");
 
         // Write a persistent log batch to disk via WalManager
@@ -179,7 +177,7 @@ mod tests {
 
         // Verify the page was reconstructed in RAM
         let frame = pool.fetch_page(page_id).unwrap();
-        let node = frame.read().unwrap();
+        let node = frame.read();
         assert_eq!(node.get_last_lsn(), 10);
 
         // Verify Log Reclamation (WAL must be truncated to 0 bytes!)

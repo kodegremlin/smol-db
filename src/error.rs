@@ -21,8 +21,8 @@ pub enum DbError {
     LruEviction,
 
     #[error("key already exists, cannot insert again: key={0}")]
-    DuplicateKey(u32),
+    DuplicateKey(u64),
 
     #[error("key does not exists: key={0}")]
-    KeyNotFound(u32),
+    KeyNotFound(u64),
 }

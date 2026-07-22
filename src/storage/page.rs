@@ -44,34 +44,34 @@ impl Page {
 }
 
 /// Fixed size of an internal cell (key + file_index).
-pub const INDEX_ENTRY_SIZE: usize = 4 + 8;
+pub const INDEX_ENTRY_SIZE: usize = 8 + 8;
 
 /// Fixed size of a leaf cell metadata (key + deleted + value_size).
 /// # Note
 /// The actual bytes are appended after this.
-pub const RECORD_META_SIZE: usize = 4 + 1 + 4;
+pub const RECORD_META_SIZE: usize = 8 + 1 + 4;
 
 /// Maximum allowed size of a value. Larger values than 400 will be rejected;
 /// what is this? a real database (¬_¬)?
 pub const MAX_VALUE_SIZE: usize = 400;
 
 /// Fixed size of the internal node header.
-pub const INTERNAL_NODE_HEADER_SIZE: usize = 1 + // cell_type (u8)
-8 + // file_index (u64)
+pub const INTERNAL_NODE_HEADER_SIZE: usize = 1 + // entry_type (u8)
+8 + // page_id (u64)
 8 + // last_lsn (u64)
-8 + // right_index (u64)
-4 + // cell_count (u32)
+8 + // rightmost_child_id (u64)
+4 + // slot_entry (u32)
 2; // free_size
 
 /// Fixed size of the leaf node header.
-pub const LEAF_NODE_HEADER_SIZE: usize = 1 + // cell_type (u8)
-8 + // file_index (u64)
+pub const LEAF_NODE_HEADER_SIZE: usize = 1 + // entry_type (u8)
+8 + // page_id (u64)
 8 + // last_lsn (u64)
-1 + // has_lsib (u8 bool)
-1 + // has_rsib (u8 bool)
-8 + // lsib_index (u64)
-8 + // rsib_index (u64)
-4 + // cell_count (u32)
+1 + // has_prev (u8 bool)
+1 + // has_next (u8 bool)
+8 + // prev_page_id (u64)
+8 + // next_page_id (u64)
+4 + // slot_count (u32)
 2; // free_size
 
 /// Maximum number of leaf cells a page can hold before requiring a split.
@@ -86,13 +86,13 @@ pub enum NodeType {
 
 #[derive(Debug, Default, Clone)]
 pub struct IndexEntry {
-    pub key: u32,
+    pub key: u64,
     pub child_page_id: u64,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct Record {
-    pub key: u32,
+    pub key: u64,
     pub data: Vec<u8>,
     pub is_deleted: bool,
 }
@@ -101,7 +101,7 @@ pub struct Record {
 pub struct InternalNode {
     pub page_id: PageId,
     pub last_lsn: u64,
-    pub rightmost_child: u64,
+    pub rightmost_child_id: u64,
     pub slot_array: Vec<u16>,
     pub entries: Vec<IndexEntry>,
     pub free_size: u16,
@@ -206,9 +206,37 @@ impl BTreeNode {
 }
 
 impl BTreeNode {
+    /// Evaluates internal routing brackets using O(log N) binary search to determine
+    /// the PageId of the child node containing `target_key`.
+    pub fn route_key(&self, target_key: u64) -> Result<PageId, DbError> {
+        match self {
+            BTreeNode::Internal(node) => {
+                let partition_idx = node.slot_array.partition_point(|&slot_idx| {
+                    // Find the first index where entry.key > target_key as that is
+                    // the internal node-point pointing to the leaf where the
+                    // key-val exists
+                    let entry_key = node.entries[slot_idx as usize].key;
+                    entry_key <= target_key
+                });
+                // If partition_idx == len(), target_key is >= all routing keys in
+                // this node. Route to the rightmost child pointer
+                if partition_idx == node.slot_array.len() {
+                    Ok(PageId(node.rightmost_child_id))
+                } else {
+                    let page_id =
+                        node.entries[node.slot_array[partition_idx] as usize].child_page_id;
+                    Ok(PageId(page_id))
+                }
+            }
+            BTreeNode::Leaf(_) => Err(DbError::CorruptPage(
+                "key search not allowed on a leaf node for this operation".into(),
+            )),
+        }
+    }
+
     /// Inserts the given key-value record into the page's `records` and updates
     /// the sorted slotted leaf array to reflect the newly inserted position.
-    pub fn insert_record(&mut self, key: u32, payload: Vec<u8>) -> Result<(), DbError> {
+    pub fn insert_record(&mut self, key: u64, payload: Vec<u8>) -> Result<(), DbError> {
         if payload.len() > MAX_VALUE_SIZE {
             return Err(DbError::TupleTooLarge(payload.len()));
         }
@@ -242,7 +270,7 @@ impl BTreeNode {
     }
 
     /// Overwrites the raw byte payload of an existing record for the given key.
-    pub fn update_record(&mut self, key: u32, payload: Vec<u8>) -> Result<(), DbError> {
+    pub fn update_record(&mut self, key: u64, payload: Vec<u8>) -> Result<(), DbError> {
         if payload.len() >= MAX_VALUE_SIZE {
             return Err(DbError::TupleTooLarge(payload.len()));
         }
@@ -265,7 +293,7 @@ impl BTreeNode {
 
     /// Marks an existing cell as logically deleted without compacting the physical
     /// bytes immediately.
-    pub fn delete_record(&mut self, key: u32) -> Result<(), DbError> {
+    pub fn delete_record(&mut self, key: u64) -> Result<(), DbError> {
         match self {
             BTreeNode::Leaf(node) => {
                 let delete_idx = node
@@ -389,7 +417,7 @@ impl BTreeNode {
                 let mut cells = vec![Record::default(); cell_count as usize];
 
                 for &cell_idx in indices.iter().take(cell_count as usize) {
-                    let key = cursor.read_u32();
+                    let key = cursor.read_u64();
                     let deleted = cursor.read_u8() != 0;
                     let size = cursor.read_u32() as usize;
                     let value = cursor.read_bytes(size);
@@ -417,21 +445,21 @@ impl BTreeNode {
                 let file_index = cursor.read_u64();
                 let last_lsn = cursor.read_u64();
                 let right_index = cursor.read_u64();
-                let cell_count = cursor.read_u32();
+                let entry_count = cursor.read_u32();
 
-                let mut indices = Vec::with_capacity(cell_count as usize);
-                for _ in 0..cell_count {
+                let mut indices = Vec::with_capacity(entry_count as usize);
+                for _ in 0..entry_count {
                     indices.push(cursor.read_u16());
                 }
                 let free_size = cursor.read_u16();
                 cursor.pos += free_size as usize;
 
-                let mut cells = vec![IndexEntry::default(); cell_count as usize];
-                for &cell_idx in indices.iter().take(cell_count as usize) {
-                    let key = cursor.read_u32();
+                let mut entries = vec![IndexEntry::default(); entry_count as usize];
+                for &entry_idx in indices.iter().take(entry_count as usize) {
+                    let key = cursor.read_u64();
                     let child_index = cursor.read_u64();
 
-                    cells[cell_idx as usize] = IndexEntry {
+                    entries[entry_idx as usize] = IndexEntry {
                         key,
                         child_page_id: child_index,
                     };
@@ -439,9 +467,9 @@ impl BTreeNode {
                 Ok(BTreeNode::Internal(InternalNode {
                     page_id: PageId(file_index),
                     last_lsn,
-                    rightmost_child: right_index,
+                    rightmost_child_id: right_index,
                     slot_array: indices,
-                    entries: cells,
+                    entries,
                     free_size,
                     is_dirty: false,
                 }))
@@ -485,7 +513,7 @@ impl BTreeNode {
 
                 for &index in &node.slot_array {
                     let cell = &node.records[index as usize];
-                    cursor.write_u32(cell.key);
+                    cursor.write_u64(cell.key);
                     cursor.write_u8(cell.is_deleted as u8);
                     cursor.write_u32(cell.data.len() as u32);
                     cursor.write_bytes(&cell.data);
@@ -504,7 +532,7 @@ impl BTreeNode {
                 cursor.write_u8(NodeType::Internal as u8);
                 cursor.write_u64(node.page_id.0);
                 cursor.write_u64(node.last_lsn);
-                cursor.write_u64(node.rightmost_child);
+                cursor.write_u64(node.rightmost_child_id);
 
                 cursor.write_u32(node.slot_array.len() as u32);
                 for &offset in &node.slot_array {
@@ -515,7 +543,7 @@ impl BTreeNode {
 
                 for &offset in &node.slot_array {
                     let cell = &node.entries[offset as usize];
-                    cursor.write_u32(cell.key);
+                    cursor.write_u64(cell.key);
                     cursor.write_u64(cell.child_page_id);
                 }
             }
@@ -628,7 +656,7 @@ mod tests {
     }
 
     /// Helper to construct a dummy Record with arbitrary key and data payload.
-    fn make_record(key: u32, data: &[u8], is_deleted: bool) -> Record {
+    fn make_record(key: u64, data: &[u8], is_deleted: bool) -> Record {
         Record {
             key,
             data: data.to_vec(),
@@ -796,7 +824,7 @@ mod tests {
         let internal = InternalNode {
             page_id: PageId(1),
             last_lsn: 555,
-            rightmost_child: 5,
+            rightmost_child_id: 5,
             slot_array: vec![0, 1, 2],
             entries: entries.clone(),
             free_size: 0,
@@ -809,7 +837,7 @@ mod tests {
         if let BTreeNode::Internal(dec_internal) = decoded {
             assert_eq!(dec_internal.page_id, PageId(1));
             assert_eq!(dec_internal.last_lsn, 555);
-            assert_eq!(dec_internal.rightmost_child, 5);
+            assert_eq!(dec_internal.rightmost_child_id, 5);
             assert_eq!(dec_internal.slot_array.len(), 3);
             assert_eq!(dec_internal.entries[1].key, 200);
             assert_eq!(dec_internal.entries[1].child_page_id, 3);

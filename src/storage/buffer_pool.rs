@@ -1,7 +1,6 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-};
+use std::{collections::HashMap, sync::Arc};
+
+use parking_lot::RwLock;
 
 use crate::{
     error::DbError,
@@ -92,9 +91,7 @@ impl BufferPool {
     /// Flushes a specific page to disk if it is dirty.
     pub fn flush_page(&mut self, page_id: PageId) -> Result<(), DbError> {
         if let Some(frame) = self.page_table.get(&page_id) {
-            let mut node_guard = frame
-                .write()
-                .map_err(|_| DbError::CorruptPage("poisoned lock".into()))?;
+            let mut node_guard = frame.write();
 
             if node_guard.is_dirty() {
                 if let Some(flusher) = &self.wal_flusher {

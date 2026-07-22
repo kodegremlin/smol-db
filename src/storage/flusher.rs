@@ -1,11 +1,13 @@
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc,
         mpsc::{self, Sender},
     },
     thread::{self, JoinHandle},
     time::Duration,
 };
+
+use parking_lot::Mutex;
 
 use crate::storage::buffer_pool::BufferPool;
 
@@ -49,7 +51,7 @@ impl BackgroundFlusher {
                         break;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if let Ok(mut pool_guard) = pool.lock()
+                        if let mut pool_guard = pool.lock()
                             && let Err(err) = pool_guard.flush_all_pages()
                         {
                             eprintln!("Background flusher encountered an error: {:?}", err);
@@ -59,7 +61,7 @@ impl BackgroundFlusher {
             }
             // Final flush to ensure durability; if we recieve a signal before
             // timeout.
-            if let Ok(mut pool_guard) = pool.lock()
+            if let mut pool_guard = pool.lock()
                 && let Err(err) = pool_guard.flush_all_pages()
             {
                 eprintln!("Failed final background flush on shutdown: {:?}", err);
