@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     fs::{File, OpenOptions},
     os::unix::fs::FileExt,
     path::Path,
@@ -157,6 +158,66 @@ pub struct LeafNode {
 }
 
 impl LeafNode {
+    /// Re-writes records into a clean vector ordered by slot index removing
+    /// tombstones completely, reducing the size of our data files.
+    /// Re-calculates the exact free_size available relative to `PAGE_SIZE`
+    pub fn compact(&mut self) {
+        let mut clean_records = Vec::with_capacity(self.slot_array.len());
+        let mut new_slots = Vec::with_capacity(self.slot_array.len());
+        let mut bytes_used = 0;
+
+        for &old_slot_idx in self.slot_array.iter() {
+            let rec = &self.records[old_slot_idx as usize];
+            if !rec.is_deleted {
+                bytes_used += RECORD_META_SIZE + rec.data.len();
+                bytes_used += SLOT_ELEM_SIZE;
+
+                clean_records.push(rec.clone());
+                new_slots.push((clean_records.len() - 1) as u16);
+            }
+        }
+        self.records = clean_records;
+        self.slot_array = new_slots;
+
+        let net_size = LEAF_NODE_HEADER_SIZE + bytes_used;
+        match net_size.cmp(&PAGE_SIZE) {
+            Ordering::Less => {
+                self.free_size = (PAGE_SIZE - net_size) as u16;
+            }
+            Ordering::Equal => {
+                self.free_size = 0;
+            }
+            Ordering::Greater => unreachable!(),
+        }
+    }
+
+    /// Splits a full leaf node in half, transferring the upper 50% of sorted records
+    /// into the given new_sibling parameter.
+    pub fn split(&mut self, new_sibling: &mut LeafNode) -> Result<u64, DbError> {
+        let mid = self.slot_array.len() / 2;
+
+        for &rec_idx in self.slot_array[mid..].iter() {
+            let rec = &self.records[rec_idx as usize];
+            new_sibling.records.push(rec.clone());
+            new_sibling
+                .slot_array
+                .push((new_sibling.records.len() - 1) as u16);
+        }
+        self.slot_array.truncate(mid);
+
+        self.compact();
+        new_sibling.compact();
+
+        if new_sibling.slot_array.is_empty() {
+            return Err(DbError::CorruptPage(
+                "leaf split resulted in empty right sibling".into(),
+            ));
+        }
+        // The promoted key is the very first key of the new right sibling.
+        let promoted_key = new_sibling.records[new_sibling.slot_array[0] as usize].key;
+        Ok(promoted_key)
+    }
+
     /// Inserts the given key-value record into the page's `records` and updates
     /// the sorted slotted leaf array to reflect the newly inserted position.
     pub fn insert_record(&mut self, key: u64, payload: Vec<u8>) -> Result<(), DbError> {

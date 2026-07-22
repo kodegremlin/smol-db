@@ -28,9 +28,10 @@ discovered something amusing while writing this project.
    the entries in a WalBatch which get's fsynced at once. So either the data exists completely as a 
    single write, or doesn't; there are not half-written or inconsistent data.
 
->> Hehe, this is so fun to write.
-
 ## To Self
 1. Learn how to avoid matching on type like BTreeNode everytime you need to access the inner type, 
    either the `Borrow`, `AsRef`, or `Deref` traits help with this, or maybe even `From` and `Into`
    revise Programming Rust and google. See if you can get something like the `transpose` method even.
+
+> Hehe, this is so fun to write.
+  currently learning the routing algorithms and learning how I can introduce compaction in the pages.
