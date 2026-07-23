@@ -229,17 +229,21 @@ impl LeafNode {
             .slot_array
             .binary_search_by_key(&row_id, |&rec_idx| self.records[rec_idx as usize].row_id)
         {
+            // key already exists, so we'll check if deleted or return duplicate err.
             Ok(slot_idx) => {
                 let rec_idx = self.slot_array[slot_idx] as usize;
                 let rec = &mut self.records[rec_idx];
                 if !rec.is_deleted {
                     return Err(DbError::DuplicateKey(row_id));
                 }
+                // overwrite tombstone data in place.
                 rec.is_deleted = false;
                 rec.data = payload;
+                // reevaluate space after compaction.
                 self.compact();
                 Ok(())
             }
+            // key does not exist, so insert_idx will the index where it should be.
             Err(insert_idx) => {
                 let required_bytes = SLOT_ELEM_SIZE + RECORD_META_SIZE + payload.len();
                 let header_len =
