@@ -52,7 +52,7 @@ impl<'a> BpTree<'a> {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        fs::{self, remove_file},
         path::{Path, PathBuf},
     };
 
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn test_btree_find_cell_routing_and_tombstones() {
-        let dir = PathBuf::from("/Volumes/External T7/");
+        let mut dir = PathBuf::from("/Volumes/External T7/");
         let mut pool = setup_pool(&dir);
         let root_id = build_test_tree(&mut pool);
         dbg!(&root_id);
@@ -184,5 +184,7 @@ mod tests {
             .expect("RESULT: lookup failed");
 
         assert_eq!(val, Some(vec![1, 5]));
+        dir.push("test.tbl");
+        let _ = remove_file(dir);
     }
 }
