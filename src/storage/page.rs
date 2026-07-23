@@ -99,7 +99,7 @@ pub struct IndexEntry {
 
 #[derive(Debug, Default, Clone)]
 pub struct Record {
-    pub key: u64,
+    pub row_id: u64,
     pub data: Vec<u8>,
     pub is_deleted: bool,
 }
@@ -214,45 +214,74 @@ impl LeafNode {
             ));
         }
         // The promoted key is the very first key of the new right sibling.
-        let promoted_key = new_sibling.records[new_sibling.slot_array[0] as usize].key;
+        let promoted_key = new_sibling.records[new_sibling.slot_array[0] as usize].row_id;
         Ok(promoted_key)
     }
 
     /// Inserts the given key-value record into the page's `records` and updates
     /// the sorted slotted leaf array to reflect the newly inserted position.
-    pub fn insert_record(&mut self, key: u64, payload: Vec<u8>) -> Result<(), DbError> {
+    /// Enforces both record count and 4-KiB byte limits.
+    pub fn insert_record(&mut self, row_id: u64, payload: Vec<u8>) -> Result<(), DbError> {
         if payload.len() > MAX_VALUE_SIZE {
             return Err(DbError::TupleTooLarge(payload.len()));
         }
-        if self.slot_array.len() >= MAX_LEAF_NODE_CELLS {
-            return Err(DbError::PageFull);
-        }
-        let insert_idx = match self
+        match self
             .slot_array
-            .binary_search_by_key(&key, |&idx| self.records[idx as usize].key)
+            .binary_search_by_key(&row_id, |&rec_idx| self.records[rec_idx as usize].row_id)
         {
-            Ok(_) => return Err(DbError::DuplicateKey(key)),
-            Err(idx) => idx,
-        };
-        let new_rec_idx = self.records.len() as u16;
-        self.records.push(Record {
-            key,
-            data: payload,
-            is_deleted: false,
-        });
-        self.slot_array.insert(insert_idx, new_rec_idx);
-        Ok(())
+            Ok(slot_idx) => {
+                let rec_idx = self.slot_array[slot_idx] as usize;
+                let rec = &mut self.records[rec_idx];
+                if !rec.is_deleted {
+                    return Err(DbError::DuplicateKey(row_id));
+                }
+                rec.is_deleted = false;
+                rec.data = payload;
+                self.compact();
+                Ok(())
+            }
+            Err(insert_idx) => {
+                let required_bytes = SLOT_ELEM_SIZE + RECORD_META_SIZE + payload.len();
+                let header_len =
+                    LEAF_NODE_HEADER_SIZE + ((self.slot_array.len() + 1) * SLOT_ELEM_SIZE);
+
+                let footer_len = self
+                    .slot_array
+                    .iter()
+                    .map(|&rec_idx| RECORD_META_SIZE + self.records[rec_idx as usize].data.len())
+                    .sum::<usize>();
+
+                if (header_len + footer_len + required_bytes) > PAGE_SIZE
+                    || self.slot_array.len() > MAX_LEAF_NODE_CELLS
+                {
+                    return Err(DbError::PageFull);
+                }
+                let new_rec_idx = self.records.len() as u16;
+                self.records.push(Record {
+                    row_id,
+                    data: payload,
+                    is_deleted: false,
+                });
+                self.slot_array.insert(insert_idx, new_rec_idx);
+                if (self.free_size as usize) >= required_bytes {
+                    self.free_size -= required_bytes as u16;
+                } else {
+                    self.free_size = 0;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Overwrites the raw byte payload of an existing record for the given key.
-    pub fn update_record(&mut self, key: u64, payload: Vec<u8>) -> Result<(), DbError> {
+    pub fn update_record(&mut self, row_id: u64, payload: Vec<u8>) -> Result<(), DbError> {
         if payload.len() >= MAX_VALUE_SIZE {
             return Err(DbError::TupleTooLarge(payload.len()));
         }
         let update_idx = self
             .slot_array
-            .binary_search_by_key(&key, |&rec_idx| self.records[rec_idx as usize].key)
-            .map_err(|_| DbError::KeyNotFound(key))?;
+            .binary_search_by_key(&row_id, |&rec_idx| self.records[rec_idx as usize].row_id)
+            .map_err(|_| DbError::KeyNotFound(row_id))?;
 
         let rec_idx = self.slot_array[update_idx] as usize;
         self.records[rec_idx].data = payload;
@@ -261,11 +290,11 @@ impl LeafNode {
 
     /// Marks an existing cell as logically deleted without compacting the physical
     /// bytes immediately.
-    pub fn delete_record(&mut self, key: u64) -> Result<(), DbError> {
+    pub fn delete_record(&mut self, row_id: u64) -> Result<(), DbError> {
         let delete_idx = self
             .slot_array
-            .binary_search_by_key(&key, |&rec_idx| self.records[rec_idx as usize].key)
-            .map_err(|_| DbError::KeyNotFound(key))?;
+            .binary_search_by_key(&row_id, |&rec_idx| self.records[rec_idx as usize].row_id)
+            .map_err(|_| DbError::KeyNotFound(row_id))?;
 
         let rec_idx = self.slot_array[delete_idx] as usize;
         self.records[rec_idx].is_deleted = true;
@@ -277,10 +306,10 @@ impl LeafNode {
     ///
     /// Returns None if the key does not exist or has been logically deleted or
     /// actually deleted after I've added compaction (that's going to be so cool).
-    pub fn get_record(&self, target_key: u64) -> Option<Vec<u8>> {
+    pub fn get_record(&self, row_id: u64) -> Option<Vec<u8>> {
         let slot_idx = self
             .slot_array
-            .binary_search_by_key(&target_key, |&rec_idx| self.records[rec_idx as usize].key)
+            .binary_search_by_key(&row_id, |&rec_idx| self.records[rec_idx as usize].row_id)
             .ok()?;
 
         let rec_idx = self.slot_array[slot_idx] as usize;
@@ -486,7 +515,7 @@ impl BTreeNode {
                     let size = cursor.read_u32() as usize;
                     let value = cursor.read_bytes(size);
                     cells[cell_idx as usize] = Record {
-                        key,
+                        row_id: key,
                         is_deleted: deleted,
                         data: value,
                     };
@@ -577,7 +606,7 @@ impl BTreeNode {
 
                 for &index in &node.slot_array {
                     let cell = &node.records[index as usize];
-                    cursor.write_u64(cell.key);
+                    cursor.write_u64(cell.row_id);
                     cursor.write_u8(cell.is_deleted as u8);
                     cursor.write_u32(cell.data.len() as u32);
                     cursor.write_bytes(&cell.data);
@@ -722,7 +751,7 @@ mod tests {
     /// Helper to construct a dummy Record with arbitrary key and data payload.
     fn make_record(key: u64, data: &[u8], is_deleted: bool) -> Record {
         Record {
-            key,
+            row_id: key,
             data: data.to_vec(),
             is_deleted,
         }
@@ -824,11 +853,11 @@ mod tests {
             assert_eq!(dec_leaf.slot_array, vec![0, 1, 2]);
             assert_eq!(dec_leaf.records.len(), 3);
 
-            assert_eq!(dec_leaf.records[0].key, 10);
+            assert_eq!(dec_leaf.records[0].row_id, 10);
             assert_eq!(dec_leaf.records[0].data, b"alice");
             assert!(!dec_leaf.records[0].is_deleted);
 
-            assert_eq!(dec_leaf.records[1].key, 20);
+            assert_eq!(dec_leaf.records[1].row_id, 20);
             assert_eq!(dec_leaf.records[1].data, b"bob-was-deleted");
             assert!(dec_leaf.records[1].is_deleted);
         } else {

@@ -33,17 +33,17 @@ impl<'a> BpTree<'a> {
     /// key a.k.a. row_id.
     ///
     /// Returns an owned copy of the payload if found and not logically deleted.
-    pub fn find_record(&mut self, target_key: u64) -> Result<Option<Vec<u8>>, DbError> {
+    pub fn find_record(&mut self, row_id: u64) -> Result<Option<Vec<u8>>, DbError> {
         let mut curr_page_id = self.root_page_id;
         loop {
             let frame = self.buffer_pool.fetch_page(curr_page_id)?;
             let node_gurad = frame.read();
             match &*node_gurad {
                 BTreeNode::Internal(node) => {
-                    let next_page_id = node.route_key(target_key)?;
+                    let next_page_id = node.route_key(row_id)?;
                     curr_page_id = next_page_id;
                 }
-                BTreeNode::Leaf(node) => return Ok(node.get_record(target_key)),
+                BTreeNode::Leaf(node) => return Ok(node.get_record(row_id)),
             }
         }
     }
@@ -80,12 +80,12 @@ mod tests {
             let mut left_leaf_guard = left_frame.write();
             if let BTreeNode::Leaf(ref mut leaf) = *left_leaf_guard {
                 leaf.records.push(Record {
-                    key: 10,
+                    row_id: 10,
                     is_deleted: false,
                     data: vec![1, 0],
                 });
                 leaf.records.push(Record {
-                    key: 15,
+                    row_id: 15,
                     is_deleted: false,
                     data: vec![1, 5],
                 });
@@ -99,17 +99,17 @@ mod tests {
             let mut right_leaf_guard = right_frame.write();
             if let BTreeNode::Leaf(ref mut leaf) = *right_leaf_guard {
                 leaf.records.push(Record {
-                    key: 20,
+                    row_id: 20,
                     is_deleted: false,
                     data: vec![2, 0],
                 });
                 leaf.records.push(Record {
-                    key: 30,
+                    row_id: 30,
                     is_deleted: false,
                     data: vec![3, 0],
                 });
                 leaf.records.push(Record {
-                    key: 25,
+                    row_id: 25,
                     is_deleted: true,
                     data: vec![2, 5],
                 }); // Tombstone
