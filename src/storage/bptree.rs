@@ -15,6 +15,16 @@ pub struct BpTree<'a> {
     root_page_id: PageId,
 }
 
+/// Communicates a structural leaf split towards the parent internal routing nodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitResult {
+    /// The primary key that divides the left and right leaf pages.
+    pub promoted_row_id: u64,
+
+    /// The physical `PageId` of the newly allocated right sibling leaf.
+    pub new_page_id: PageId,
+}
+
 impl<'a> BpTree<'a> {
     /// Constructs a initialized B+Tree with the given `BufferPool` and `PageId`.
     pub fn new(pool: &'a mut BufferPool, root_page_id: PageId) -> Self {
@@ -27,6 +37,92 @@ impl<'a> BpTree<'a> {
     /// Returns the active root PageId.
     pub fn get_root_id(&self) -> PageId {
         self.root_page_id
+    }
+
+    /// Inserts a key-value payload directly into a target leaf page. If physical
+    /// capacity is exceeded, allocates a sibling page from the `BufferPool`,
+    /// splits the current leaf into half writing the other half of the data into
+    /// the new sibling leaf, and then compact the old page.
+    ///
+    /// Returns the `promoted_row_id` and the `new_page_id` if split happens as
+    /// `Some(SplitResult)` or `None` if data was written to the current page only.
+    pub fn insert_leaf(
+        &mut self,
+        leaf_page_id: PageId,
+        row_id: u64,
+        payload: Vec<u8>,
+        lsn: u64,
+    ) -> Result<Option<SplitResult>, DbError> {
+        let leaf_frame = self.buffer_pool.fetch_page(leaf_page_id)?;
+        let mut node_guard = leaf_frame.write();
+
+        let left_leaf = match &mut *node_guard {
+            BTreeNode::Leaf(node) => node,
+            BTreeNode::Internal(_) => {
+                return Err(DbError::CorruptPage(
+                    "attempted to insert data on a internal routing node".into(),
+                ));
+            }
+        };
+        match left_leaf.insert_record(row_id, payload.clone()) {
+            Ok(()) => {
+                node_guard.mark_dirty(lsn);
+                return Ok(None);
+            }
+            Err(DbError::DuplicateKey(key)) => return Err(DbError::DuplicateKey(key)),
+            Err(DbError::PageFull) => {
+                // physical page capacity exceeded, we'll split the page below.
+            }
+            Err(err) => return Err(err),
+        }
+        let (new_leaf_id, new_leaf_frame) = self.buffer_pool.new_page(true)?;
+        let mut new_node_guard = new_leaf_frame.write();
+
+        let right_leaf = match &mut *new_node_guard {
+            BTreeNode::Leaf(node) => node,
+            _ => unreachable!("new_page(true) must return a LeafNode"),
+        };
+        let promoted_row_id = left_leaf.split(right_leaf)?;
+
+        if row_id < promoted_row_id {
+            left_leaf.insert_record(row_id, payload)?;
+        } else {
+            right_leaf.insert_record(row_id, payload)?;
+        }
+        // store the previous pointer state
+        let old_next_id = left_leaf.next_page_id;
+        let old_has_next = left_leaf.has_next;
+
+        // wire the new right sibling node between the left_leaf and old right.
+        right_leaf.has_prev = true;
+        right_leaf.prev_page_id = leaf_page_id.into();
+
+        right_leaf.has_next = old_has_next;
+        right_leaf.next_page_id = old_next_id;
+
+        // wire the left_leaf to point towards the right_leaf.
+        left_leaf.has_next = true;
+        left_leaf.next_page_id = new_leaf_id.into();
+
+        // If an old right sibling existed, fetch it and connects its backward
+        // pointer.
+        if old_has_next {
+            let old_right_frame = self.buffer_pool.fetch_page(PageId(old_next_id))?;
+            let mut old_right_guard = old_right_frame.write();
+
+            if let BTreeNode::Leaf(ref mut old_right_leaf) = *old_right_guard {
+                old_right_leaf.has_prev = true;
+                old_right_leaf.prev_page_id = new_leaf_id.into();
+                old_right_guard.mark_dirty(lsn);
+            }
+        }
+        node_guard.mark_dirty(lsn);
+        new_node_guard.mark_dirty(lsn);
+
+        Ok(Some(SplitResult {
+            promoted_row_id,
+            new_page_id: new_leaf_id,
+        }))
     }
 
     /// Executes a binary search to retreive a record payload by the given primary
@@ -52,139 +148,106 @@ impl<'a> BpTree<'a> {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs::{self, remove_file},
-        path::{Path, PathBuf},
+        fs::{self},
+        path::PathBuf,
     };
 
-    use crate::storage::{
-        bptree::BpTree,
-        buffer_pool::BufferPool,
-        page::{BTreeNode, DiskManager, IndexEntry, PageId, Record},
+    use crate::{
+        error::DbError,
+        storage::{
+            bptree::BpTree,
+            buffer_pool::BufferPool,
+            page::{BTreeNode, DiskManager},
+        },
     };
 
-    fn setup_pool(dir_path: &Path) -> BufferPool {
-        let db_path = dir_path.join("test.tbl");
-        let _ = fs::remove_file(&db_path);
-        let disk_manager = DiskManager::open(&db_path).unwrap();
-        BufferPool::new(disk_manager, 10, None)
-    }
-
-    /// Manually construct a 2-level B+ Tree on disk:
-    /// Root (page 0, internal): key 20 -> left child (page 1), right child (page 2)
-    /// Left child (page 1, leaf): keys [10, 15]
-    /// Right child (page 2, leaf): keys [20, 25 (deleted), 30]
-    fn build_test_tree(pool: &mut BufferPool) -> PageId {
-        // 1. Allocate Left Leaf Page legitimately through the Buffer Pool
-        let (left_id, left_frame) = pool.new_page(true).unwrap();
-        {
-            let mut left_leaf_guard = left_frame.write();
-            if let BTreeNode::Leaf(ref mut leaf) = *left_leaf_guard {
-                leaf.records.push(Record {
-                    row_id: 10,
-                    is_deleted: false,
-                    data: vec![1, 0],
-                });
-                leaf.records.push(Record {
-                    row_id: 15,
-                    is_deleted: false,
-                    data: vec![1, 5],
-                });
-                leaf.slot_array = vec![0, 1];
-            }
-            left_leaf_guard.mark_dirty(0);
-        }
-
-        let (right_id, right_frame) = pool.new_page(true).unwrap();
-        {
-            let mut right_leaf_guard = right_frame.write();
-            if let BTreeNode::Leaf(ref mut leaf) = *right_leaf_guard {
-                leaf.records.push(Record {
-                    row_id: 20,
-                    is_deleted: false,
-                    data: vec![2, 0],
-                });
-                leaf.records.push(Record {
-                    row_id: 30,
-                    is_deleted: false,
-                    data: vec![3, 0],
-                });
-                leaf.records.push(Record {
-                    row_id: 25,
-                    is_deleted: true,
-                    data: vec![2, 5],
-                }); // Tombstone
-                leaf.slot_array = vec![0, 2, 1];
-
-                // Wire backward sibling link
-                leaf.has_prev = true;
-                leaf.prev_page_id = left_id.into();
-            }
-            right_leaf_guard.mark_dirty(0);
-        }
-        {
-            let mut left_leaf_guard = left_frame.write();
-            if let BTreeNode::Leaf(ref mut leaf) = *left_leaf_guard {
-                leaf.has_next = true;
-                leaf.next_page_id = right_id.into();
-            }
-            left_leaf_guard.mark_dirty(0);
-        }
-
-        let (root_id, root_frame) = pool.new_page(false).unwrap();
-        {
-            let mut root_guard = root_frame.write();
-            if let BTreeNode::Internal(ref mut node) = *root_guard {
-                node.rightmost_child_id = right_id;
-                node.entries.push(IndexEntry {
-                    key: 20,
-                    child_page_id: left_id.into(),
-                });
-                node.slot_array = vec![0];
-            }
-            root_guard.mark_dirty(0);
-        }
-        pool.flush_all_pages().unwrap();
-        root_id
+    fn setup_pool(name: &str) -> (BufferPool, PathBuf) {
+        let mut path = PathBuf::from("/Volumes/External T7/");
+        path.push(format!("test_{}.tbl", name));
+        let _ = fs::remove_file(&path);
+        let disk_manager = DiskManager::open(&path).expect("opening DiskManager failed");
+        let pool = BufferPool::new(disk_manager, 20, None);
+        (pool, path)
     }
 
     #[test]
-    fn test_btree_find_cell_routing_and_tombstones() {
-        let mut dir = PathBuf::from("/Volumes/External T7/");
-        let mut pool = setup_pool(&dir);
-        let root_id = build_test_tree(&mut pool);
-        dbg!(&root_id);
+    fn test_insert_leaf_duplicate_rejection() {
+        let (mut pool, db_path) = setup_pool("simple_insert");
+
+        let (root_id, _) = pool.new_page(true).unwrap();
         let mut btree = BpTree::new(&mut pool, root_id);
 
-        let val = btree
-            .find_record(10)
-            .expect("RESULT: lookup failed");
+        let result = btree
+            .insert_leaf(root_id, 100, vec![1, 2, 3], 10)
+            .unwrap();
+        assert!(result.is_none());
 
-        assert_eq!(val, Some(vec![1, 0]));
+        let result = btree
+            .insert_leaf(root_id, 101, vec![4, 5, 6], 11)
+            .unwrap();
+        assert!(result.is_none());
 
-        let val = btree
-            .find_record(30)
-            .expect("RESULT: lookup failed");
+        assert_eq!(btree.find_record(100).unwrap(), Some(vec![1, 2, 3]));
+        assert_eq!(btree.find_record(101).unwrap(), Some(vec![4, 5, 6]));
 
-        assert_eq!(val, Some(vec![3, 0]));
+        let dup_result = btree.insert_leaf(root_id, 100, vec![10, 11, 13], 12);
+        assert!(matches!(dup_result, Err(DbError::DuplicateKey(100))));
 
-        let val = btree
-            .find_record(25)
-            .expect("RESULT: lookup failed");
+        let _ = fs::remove_file(db_path);
+    }
 
-        assert_eq!(val, None, "deleted cell should return None");
+    #[test]
+    fn test_insert_leaf_split_and_sibling_chain() {
+        let (mut pool, db_path) = setup_pool("split_chain");
+        let (root_id, _) = pool.new_page(true).unwrap();
+        let mut btree = BpTree::new(&mut pool, root_id);
 
-        let val = btree
-            .find_record(99)
-            .expect("RESULT: lookup failed");
+        let large_payload = vec![0u8; 400];
+        let mut split_res = None;
 
-        assert_eq!(val, None);
+        for key in 1..=15 {
+            if let Some(result) = btree
+                .insert_leaf(root_id, key, large_payload.clone(), key)
+                .unwrap()
+            {
+                split_res = Some(result);
+                break;
+            }
+        }
+        let split = split_res.expect("leaf failed to split exceeding 4KB capacity!");
+        assert!(
+            split.promoted_row_id >= 5,
+            "row_id smaller than expected {}",
+            split.promoted_row_id
+        );
+        assert_ne!(split.new_page_id, root_id);
 
-        let val = btree
-            .find_record(15)
-            .expect("RESULT: lookup failed");
+        // verify sibling chaining & compaction
 
-        assert_eq!(val, Some(vec![1, 5]));
-        dir.push("test.tbl");
-        let _ = remove_file(dir);
+        let left_frame = pool.fetch_page(root_id).unwrap();
+        let right_frame = pool.fetch_page(split.new_page_id).unwrap();
+
+        let left_node = left_frame.read();
+        let right_node = right_frame.read();
+
+        match (&*left_node, &*right_node) {
+            (BTreeNode::Leaf(left), BTreeNode::Leaf(right)) => {
+                // verify left_page pointer to next node
+                assert!(left.has_next);
+                assert_eq!(left.next_page_id, split.new_page_id.into());
+
+                // verify right_page pointer to prev node
+                assert!(right.has_prev);
+                assert_eq!(right.prev_page_id, root_id.into());
+
+                assert_eq!(
+                    right.records[right.slot_array[0] as usize].row_id,
+                    split.promoted_row_id
+                );
+                assert!(left.free_size > 1500, "compaction failed to reclaim")
+            }
+            _ => panic!("expected btree leaf nodes"),
+        }
+        let _ = fs::remove_file(db_path);
     }
 }
