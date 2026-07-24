@@ -267,6 +267,7 @@ impl LeafNode {
                     is_deleted: false,
                 });
                 self.slot_array.insert(insert_idx, new_rec_idx);
+
                 if (self.free_size as usize) >= required_bytes {
                     self.free_size -= required_bytes as u16;
                 } else {
